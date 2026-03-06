@@ -1,5 +1,6 @@
-ccxt
+ccxt>=4.3.0
 pandas>=2.2.3
-numpy>=2.1
-ta
-aiohttp
+numpy>=2.1.0
+ta>=0.11.0
+aiohttp>=3.10.0
+python-telegram-bot>=21.0
