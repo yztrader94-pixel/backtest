@@ -1,19 +1,41 @@
 """
-SMC PRO BACKTESTER v3.0  (fixed)
+SMC PRO BACKTESTER v3.1
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ROOT CAUSE FIX:
-  v2 Sniper = 19 trades / 90d / 15 pairs
-  Doubling to 180d+25 pairs only gives ~63 — still not enough.
-  Solution: run 3 configs IN PARALLEL so we accumulate 100+
-  on B_tuned while also stress-testing C_sniper.
-  Walk is done ONCE per symbol, filtered per config.
+PATCH OVER v3.0  —  ISOLATED CHANGES ONLY:
 
-NEW vs v2:
-  1. 180d lookback, 25 pairs
-  2. DEDUPE_HOURS = 2  (was 4)
-  3. Improved TP: BE+0.25R trail after TP1, TP1-trail after TP2
-  4. BTC 200 EMA regime filter on longs (per-config toggle)
-  5. Diagnostic: raw score distribution logged to CSV
+  KEY FINDING FROM v3.0:
+  ┌─────────────────────────────────────────────┐
+  │  B_tuned score buckets:                     │
+  │    80-84: 94t  WR=39%  avg=+0.134R  🔴      │
+  │    85-89: 35t  WR=57%  avg=+0.520R  ✅      │
+  │    90+:    5t  WR=60%  avg=+0.842R  ✅      │
+  │  The 80-82 SHORT bucket is creating the     │
+  │  losing streaks and the -15.79R MaxDD.      │
+  └─────────────────────────────────────────────┘
+
+  CHANGE 1 — B_tuned+ (the key test):
+    SHORT threshold: 80 → 83
+    LONG  threshold: 82 → 82  (unchanged)
+    Goal: remove weak 80-82 shorts, keep 80-85 longs
+
+  CHANGE 2 — TP1 trail tweak (A/B test):
+    Test BE+0.00R (breakeven exact) vs BE+0.25R
+    Added D_be_exact config to compare side-by-side
+    Hypothesis: tighter trail = more TP2 conversions
+
+  CHANGE 3 — MATIC removed (not on Binance futures)
+    Replaced with HBAR which has clean structure
+
+  EVERYTHING ELSE IDENTICAL TO v3.0:
+    Same 180d, 25 pairs, DEDUPE=2H
+    Same structural gates, same OB engine
+    Same BTC regime filter
+    Same C_sniper config (growing toward 60+ trades)
+
+OUTPUT:
+  backtest_v31_trades.csv
+  backtest_v31_summary.csv
+  backtest_v31_signals.csv
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -51,37 +73,54 @@ WARM_UP_BARS_1H = 100
 DEDUPE_HOURS    = 2        # loosened from 4 → catch more setups
 
 OUTPUT_DIR  = "/mnt/user-data/outputs"
-OUTPUT_CSV  = "backtest_v3_trades.csv"
-SUMMARY_CSV = "backtest_v3_summary.csv"
-DIAG_CSV    = "backtest_v3_signals.csv"   # raw signal log
+OUTPUT_CSV  = "backtest_v31_trades.csv"
+SUMMARY_CSV = "backtest_v31_summary.csv"
+DIAG_CSV    = "backtest_v31_signals.csv"   # raw signal log
 
 # ════════════════════════════════════════════════
 #  3 CONFIGS IN PARALLEL
 # ════════════════════════════════════════════════
 CONFIGS = {
     'A_baseline': {
-        'label':           'v2 Baseline',
+        # Control group — unchanged from v3.0 for direct comparison
+        'label':           'v3 Baseline',
         'min_score_long':  75,
         'min_score_short': 75,
         'triple_ema_long': False,
         'btc_filter':      False,
+        'trail_be_r':      0.25,   # BE+0.25R after TP1
         'description':     'MIN=75, no gates (control)',
     },
-    'B_tuned': {
-        'label':           'v3 Tuned',
+    'B_plus': {
+        # KEY TEST: SHORT raised to 83, isolates the 80-82 drag
+        'label':           'v3 Tuned+',
         'min_score_long':  82,
-        'min_score_short': 80,
+        'min_score_short': 83,     # was 80 — kills the weak 80-82 bucket
         'triple_ema_long': True,
         'btc_filter':      True,
-        'description':     'MIN_L=82+TripleEMA+BTC, MIN_S=80',
+        'trail_be_r':      0.25,
+        'description':     'MIN_L=82+TripleEMA+BTC, MIN_S=83',
     },
     'C_sniper': {
+        # Unchanged — growing toward 60+ trades
         'label':           'v3 Sniper',
         'min_score_long':  87,
         'min_score_short': 85,
         'triple_ema_long': True,
         'btc_filter':      True,
+        'trail_be_r':      0.25,
         'description':     'MIN_L=87+TripleEMA+BTC, MIN_S=85',
+    },
+    'D_be_exact': {
+        # TP TRAIL A/B TEST: same as B_plus but trail to BE+0.00R
+        # Hypothesis: more room after TP1 → fewer TP1+BE exits → more TP2 hits
+        'label':           'v3 Tuned+ BE_exact',
+        'min_score_long':  82,
+        'min_score_short': 83,
+        'triple_ema_long': True,
+        'btc_filter':      True,
+        'trail_be_r':      0.00,   # exact breakeven, not BE+0.25R
+        'description':     'MIN_L=82, MIN_S=83, trail=BE+0.00R',
     },
 }
 
@@ -96,7 +135,7 @@ SYMBOLS = [
     'SUI/USDT:USDT', 'TIA/USDT:USDT', 'INJ/USDT:USDT',
     'WLD/USDT:USDT', 'APT/USDT:USDT', 'SEI/USDT:USDT',
     'NEAR/USDT:USDT','FTM/USDT:USDT', 'ATOM/USDT:USDT',
-    'LTC/USDT:USDT', 'MATIC/USDT:USDT','FIL/USDT:USDT',
+    'LTC/USDT:USDT', 'HBAR/USDT:USDT','FIL/USDT:USDT',
     'STX/USDT:USDT',
 ]
 
@@ -461,12 +500,14 @@ def passes_config(sig, cfg):
 #  TP1 hit → SL to BE+0.25R
 #  TP2 hit → SL trails to TP1 price
 # ════════════════════════════════════════════════
-def resolve_trade(sig, future_df1h):
+def resolve_trade(sig, future_df1h, trail_be_r=0.25):
     entry=sig['entry']; sl_orig=sig['sl']
     tp1,tp2,tp3=sig['tp1'],sig['tp2'],sig['tp3']
     direction=sig['bias']; risk=abs(entry-sl_orig)
 
-    be_plus      = entry + risk*0.25 if direction=='LONG' else entry - risk*0.25
+    # trail_be_r: how many R above/below entry to trail SL after TP1
+    # 0.25 = BE+0.25R (v3 default), 0.00 = exact breakeven (D_be_exact test)
+    be_plus      = entry + risk*trail_be_r if direction=='LONG' else entry - risk*trail_be_r
     trail_tp2    = tp1   # after TP2, SL moves to TP1 level
 
     tp1_hit=tp2_hit=tp3_hit=sl_hit=False
@@ -500,7 +541,7 @@ def resolve_trade(sig, future_df1h):
     elif sl_hit and tp2_hit:
         pnl_r=(1.5+2.5)/2-0.05; outcome='TP2+trail'
     elif sl_hit and tp1_hit:
-        pnl_r=(1.5+0.25)/2; outcome='TP1+BE'   # half at TP1, half stopped at BE+0.25
+        pnl_r=(1.5+trail_be_r)/2; outcome='TP1+BE'   # half at TP1, half at BE+trail
     elif tp2_hit:
         r_exit=(exit_price-entry)/risk*(1 if direction=='LONG' else -1)
         pnl_r=(1.5+2.5+r_exit)/3; outcome='TP2'
@@ -581,28 +622,37 @@ async def backtest_symbol(exchange, symbol, data_override=None):
         raw_signals.append({'ts':ts_now, 'sym':symbol.replace('/USDT:USDT',''),
                             'bias':sig['bias'],'score':sig['score'],'btc_ok':sig['btc_long_ok']})
 
-        # Resolve trade outcome once
+        # Pre-slice future bars once (shared across all configs)
         future_df=df1.iloc[bar_idx+1:min(bar_idx+1+MAX_TRADE_BARS,len(df1))].reset_index(drop=True)
         if len(future_df)<3: continue
-        result=resolve_trade(sig, future_df)
 
-        trade_base={**sig,**result,
-                    'entry_time':ts_now.strftime('%Y-%m-%d %H:%M'),
-                    'symbol_clean':symbol.replace('/USDT:USDT','')}
+        # Cache resolved results per unique trail_be_r value
+        resolved_cache={}
 
         for cfg_key, cfg in CONFIGS.items():
             if not passes_config(sig, cfg): continue
             last=last_signal[cfg_key].get(symbol)
             if last and (ts_now-last).total_seconds()/3600 < DEDUPE_HOURS: continue
             last_signal[cfg_key][symbol]=ts_now
+
+            # Resolve with this config's trail setting (cached if same value)
+            tbe=cfg.get('trail_be_r', 0.25)
+            if tbe not in resolved_cache:
+                resolved_cache[tbe]=resolve_trade(sig, future_df, trail_be_r=tbe)
+            result=resolved_cache[tbe]
+
+            trade_base={**sig,**result,
+                        'entry_time':ts_now.strftime('%Y-%m-%d %H:%M'),
+                        'symbol_clean':symbol.replace('/USDT:USDT',''),
+                        'trail_be_r':tbe}
             config_trades[cfg_key].append({**trade_base,'config':cfg_key})
             logger.info(f"  [{cfg_key}] {symbol.replace('/USDT:USDT',''):<6} "
-                        f"{sig['bias']:<5} sc={sig['score']} btc={sig['btc_long_ok']} "
+                        f"{sig['bias']:<5} sc={sig['score']} trail={tbe} "
                         f"→ {result['outcome']} {result['pnl_r']:+.2f}R")
 
     counts={k:len(v) for k,v in config_trades.items()}
     logger.info(f"  ✅ {symbol.replace('/USDT:USDT','')} raw_signals={len(raw_signals)} "
-                f"A={counts['A_baseline']} B={counts['B_tuned']} C={counts['C_sniper']}")
+                f"A={counts['A_baseline']} B+={counts['B_plus']} C={counts['C_sniper']} D={counts['D_be_exact']}")
     return config_trades, raw_signals
 
 
@@ -708,7 +758,7 @@ def save_outputs(all_config_trades, summaries, all_raw_signals):
     if all_trades:
         cols=['config','entry_time','symbol_clean','bias','quality','score',
               'triple_ema','hh_ll','pd_zone','structure','btc_long_ok',
-              'entry','sl','tp1','tp2','tp3','risk_pct',
+              'trail_be_r','entry','sl','tp1','tp2','tp3','risk_pct',
               'outcome','pnl_r','bars_held',
               'tp1_hit','tp2_hit','tp3_hit','sl_hit','reasons']
         path=os.path.join(OUTPUT_DIR,OUTPUT_CSV)
@@ -741,9 +791,9 @@ def save_outputs(all_config_trades, summaries, all_raw_signals):
 async def main():
     exchange=ccxt.binance({'enableRateLimit':True,'options':{'defaultType':'future'}})
 
-    print(f"\n🚀 SMC PRO BACKTESTER v3.0 (fixed)")
-    print(f"   {LOOKBACK_DAYS}d | {len(SYMBOLS)} pairs | DEDUP={DEDUPE_HOURS}H | 3 configs")
-    print(f"   TP logic: BE+0.25R after TP1 | BTC regime filter on longs\n")
+    print(f"\n🚀 SMC PRO BACKTESTER v3.1")
+    print(f"   {LOOKBACK_DAYS}d | {len(SYMBOLS)} pairs | DEDUP={DEDUPE_HOURS}H | 4 configs")
+    print(f"   B+ SHORT≥83 | D trail=BE+0.00R A/B test | BTC regime filter\n")
     for k,cfg in CONFIGS.items():
         print(f"   [{k}] {cfg['description']}")
     print()
@@ -779,8 +829,8 @@ async def main():
 
     total={k:len(all_config_trades[k]) for k in CONFIGS}
     print(f"\n📦 Totals: A={total['A_baseline']}  B={total['B_tuned']}  C={total['C_sniper']}")
-    if total['B_tuned']<100:
-        print(f"  ⚠️  B_tuned has {total['B_tuned']} trades — edge not yet confirmed (need 100+)")
+    if total['B_plus']<80:
+        print(f"  ⚠️  B_plus has {total['B_plus']} trades — may need more pairs/days")
 
     summaries=print_comparison(all_config_trades, all_raw_signals)
     save_outputs(all_config_trades, summaries, all_raw_signals)
