@@ -605,14 +605,6 @@ async def run_backtest():
 
     equity_return  = (equity_curve[-1] / equity_curve[0] - 1) * 100
     trades_taken   = len(equity_curve) - 1
-
-    # Kelly fraction: f = WR - (1-WR)/RR
-    avg_win_r  = (df[trail_mask]['pnl'].mean() / df[trail_mask]['sl_pct'].mean()) if n_trail > 0 else 0
-    avg_loss_r = 1.0  # by definition (SL = 1R)
-    wr_frac    = (n_trail + n_be) / (n_trail + n_sl + n_be) if (n_trail + n_sl + n_be) > 0 else 0
-    kelly_f    = wr_frac - (1 - wr_frac) / avg_win_r if avg_win_r > 0 else 0
-    kelly_2pct = kelly_f * 100  # as % of Kelly full
-
     skipped = 0  # not applicable in sequential sim
 
     # Outcome breakdown — v4 uses TRAIL instead of TP2
@@ -627,6 +619,12 @@ async def run_backtest():
     n_be     = be_mask.sum()
     n_tp1    = tp1only_mask.sum()
     n_timeout= timeout_mask.sum()
+
+    # Kelly fraction: f = WR - (1-WR)/RR
+    avg_win_r  = (df[trail_mask]['pnl'].mean() / df[trail_mask]['sl_pct'].mean()) if n_trail > 0 else 0
+    wr_frac    = (n_trail + n_be) / (n_trail + n_sl + n_be) if (n_trail + n_sl + n_be) > 0 else 0
+    kelly_f    = wr_frac - (1 - wr_frac) / avg_win_r if avg_win_r > 0 else 0
+    kelly_2pct = kelly_f * 100
 
     # WR = trail wins vs SL losses (decisive closes)
     closed   = n_trail + n_sl
