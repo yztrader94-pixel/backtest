@@ -1,892 +1,1365 @@
 """
-╔══════════════════════════════════════════════════════════════╗
-║     SWING BOT BACKTEST v8.0 — TARGET 80-85% WIN RATE       ║
-║                                                              ║
-║  Strategy: Stacked elite filters — fewer, cleaner signals   ║
-║                                                              ║
-║  Changes from v7:                                           ║
-║    - MIN_SCORE_PCT: 0.63 → 0.75   (v7 showed 75%WR here)  ║
-║    - ADX_MIN: 40 → 50             (ultra-strong trend only) ║
-║    - ATR_SL_MULT: 1.2 → 1.5      (wider SL, less noise)   ║
-║    - REQUIRE_RSI_SHORT: rsi>58    (momentum confirmation)   ║
-║    - REQUIRE_DI_MARGIN: DI->DI+   (directional conviction) ║
-║    - BLOCK_EXTENDED_SHORT: True   (no 4h_below_200ema)     ║
-║    - REQUIRE_MACD_BEAR: True      (must have MACD signal)  ║
-║    - COOLDOWN_HOURS: 24 → 48      (no chasing)             ║
-║                                                              ║
-║  Goal: 80-85% WR with ~10-30 signals/month                 ║
-║  Output: backtest_swing_v8_results.xlsx                     ║
-╚══════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════════════╗
+║        SMC PRO v4.0 — FULL HISTORICAL BACKTESTER                        ║
+║                                                                          ║
+║  Mirrors your exact bot logic (OB, BOS/MSS, score, gates)               ║
+║  Walk-forward over 4H / 1H / 15M — no lookahead bias                   ║
+║  Outputs: CSV trades + detailed HTML report + console summary            ║
+╚══════════════════════════════════════════════════════════════════════════╝
 
-Run:
-    pip install ccxt ta pandas numpy xlsxwriter
-    python backtest_swing_v8.py
+HOW IT WORKS
+────────────
+1. Downloads historical OHLCV for every USDT pair (or a curated list)
+2. Walks forward in 1H steps (simulating your 30-min scan)
+3. At each step it slices data UP TO that bar — zero lookahead
+4. Runs the same analyse() logic from your live bot
+5. When a signal fires it looks FORWARD in the 1H data to see
+   which of TP1 / TP2 / TP3 / SL is hit first (realistic order)
+6. Records every trade + all debug fields
+7. Generates an HTML report with every metric you need to tune
+
+SETUP (run once)
+────────────────
+  pip install ccxt pandas numpy ta rich tqdm
+
+USAGE
+─────
+  python smc_backtester.py
+
+CONFIG SECTION is at the top — edit PAIRS, DATE_FROM, DATE_TO, etc.
 """
 
 import asyncio
-import logging
-import warnings
-warnings.filterwarnings('ignore')
-
-import numpy as np
-import pandas as pd
-import ta
 import ccxt.async_support as ccxt
+import pandas as pd
+import numpy as np
+import ta
+import warnings
+import json
+import os
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+from collections import defaultdict
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%H:%M:%S')
-logger = logging.getLogger('SwingBacktest')
+warnings.filterwarnings("ignore")
 
-# ── SETTINGS (must match swing_bot_v1.py exactly) ──────────────────────────
+# ─── try importing optional pretty libs ───────────────────────────────────
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.progress import track as rich_track
+    console = Console()
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
 
-LOOKBACK_DAYS     = 360
-TOP_N_PAIRS       = 600
-MIN_VOLUME_USDT   = 500_000
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
 
-ATR_TP1_MULT      = 2.0   # unchanged
-ATR_SL_MULT       = 1.5   # WIDENED from 1.2 — reduce noise SLs
-TRAIL_ATR_MULT    = 2.5   # unchanged
-TP1_POSITION_PCT  = 0.4   # unchanged
 
-MIN_SCORE_PCT     = 0.65  # RAISED from 0.63 — v7 showed 75%+ band = 75% WR
-QUALITY_PREMIUM   = 0.85  # RAISED — ultra-elite signals only
-ADX_MIN           = 50    # RAISED from 40 — ultra-strong trend only
-LONG_BULL_ONLY    = True
-REQUIRE_BELOW_200EMA_SHORT = False  # keep off — 4h_below_200ema = 46% WR killer
+# ══════════════════════════════════════════════════════════════════════════
+#  ██████╗ ██████╗ ███╗   ██╗███████╗██╗ ██████╗
+#  ██╔════╝██╔═══██╗████╗  ██║██╔════╝██║██╔════╝
+#  ██║     ██║   ██║██╔██╗ ██║█████╗  ██║██║  ███╗
+#  ██║     ██║   ██║██║╚██╗██║██╔══╝  ██║██║   ██║
+#  ╚██████╗╚██████╔╝██║ ╚████║██║     ██║╚██████╔╝
+#   ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝     ╚═╝ ╚═════╝
+# ══════════════════════════════════════════════════════════════════════════
 
-# ── v8 NEW FILTERS ──
-REQUIRE_RSI_GATE       = True   # SHORT: 4H RSI must be > 58 (not already oversold)
-RSI_SHORT_MIN          = 58     # momentum still bearish, not oversold bounce
-REQUIRE_MACD_SIGNAL    = True   # must have macd_cross OR macd_hist_expanding (not just score pts)
-BLOCK_EXTENDED_SHORT   = True   # block if 4H price > 15% below 200 EMA (chasing extended)
-EXTENDED_SHORT_PCT     = 0.15   # 15% below 200EMA = already extended, skip
-REQUIRE_DI_MARGIN      = True   # DI- must exceed DI+ by at least 5pts for SHORTs
-DI_MARGIN_MIN          = 5      # directional conviction threshold
-REQUIRE_AROON_CONFIRM  = True   # Aroon must be < -50 for SHORTs (confirmed downtrend)
+# ── Date range ────────────────────────────────────────────────────────────
+DATE_FROM = "2024-01-01"   # start of backtest
+DATE_TO   = "2025-03-01"   # end   of backtest
 
-MAX_TRADE_DAYS    = 10    # unchanged
-COOLDOWN_HOURS    = 48    # RAISED from 24 — no chasing back-to-back on same pair
-MAX_SCORE         = 40.0
+# ── Pairs to test (None = auto-fetch top-volume perps) ────────────────────
+# Set to None for full market scan, or specify a list like below
+PAIRS = [
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
+    "XRP/USDT:USDT", "DOGE/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT",
+    "ADA/USDT:USDT", "DOT/USDT:USDT",  "MATIC/USDT:USDT","LTC/USDT:USDT",
+    "UNI/USDT:USDT", "ATOM/USDT:USDT", "FIL/USDT:USDT",  "NEAR/USDT:USDT",
+    "APT/USDT:USDT", "ARB/USDT:USDT",  "OP/USDT:USDT",   "SUI/USDT:USDT",
+    "INJ/USDT:USDT", "TIA/USDT:USDT",  "WLD/USDT:USDT",  "JTO/USDT:USDT",
+    "PYTH/USDT:USDT","ORDI/USDT:USDT", "STX/USDT:USDT",  "SEI/USDT:USDT",
+    "FET/USDT:USDT", "RUNE/USDT:USDT",
+]
 
-# ── REALISTIC SIMULATION ──
-MAX_CONCURRENT    = 10
-RISK_PER_TRADE    = 0.02
+# ── Bot settings (must match your live bot exactly) ────────────────────────
+MIN_SCORE          = 75
+OB_TOLERANCE_PCT   = 0.008
+OB_IMPULSE_ATR_MULT= 1.0
+STRUCTURE_LOOKBACK = 20
+HH_LL_LOOKBACK     = 10
+HH_LL_BONUS        = 8
+MAX_SIGNALS_PER_SCAN = 6
 
-OUTPUT_FILE = '/mnt/user-data/outputs/backtest_swing_v8_results.xlsx'
+# ── Backtester settings ────────────────────────────────────────────────────
+WALK_STEP_BARS_1H  = 1          # walk forward 1 bar at a time (1H)
+MIN_WARMUP_BARS    = 150        # bars needed before first signal allowed
+MAX_TRADE_BARS     = 48         # 48 × 1H = 48H max trade duration
+CACHE_DIR          = Path("./bt_cache")   # raw OHLCV cache folder
+RESULTS_DIR        = Path("./bt_results") # outputs folder
 
-# ── INDICATORS ─────────────────────────────────────────────────────────────
+# ── Exchange (public data only — no key needed) ────────────────────────────
+EXCHANGE_ID        = "binance"
+EXCHANGE_TYPE      = "future"   # perps
 
-def add_indicators(df):
+# ══════════════════════════════════════════════════════════════════════════
+#  INDICATORS  (identical to your live bot)
+# ══════════════════════════════════════════════════════════════════════════
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if len(df) < 55:
+        return df
     try:
-        df['ema_9']   = ta.trend.EMAIndicator(df['close'], 9).ema_indicator()
+        df = df.copy()
         df['ema_21']  = ta.trend.EMAIndicator(df['close'], 21).ema_indicator()
         df['ema_50']  = ta.trend.EMAIndicator(df['close'], 50).ema_indicator()
-        df['ema_200'] = ta.trend.EMAIndicator(df['close'], 200).ema_indicator()
+        df['ema_200'] = ta.trend.EMAIndicator(df['close'], min(200, len(df)-1)).ema_indicator()
+        df['rsi']     = ta.momentum.RSIIndicator(df['close'], 14).rsi()
 
-        atr_ind   = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], 14)
-        df['atr'] = atr_ind.average_true_range()
+        macd = ta.trend.MACD(df['close'])
+        df['macd']        = macd.macd()
+        df['macd_signal'] = macd.macd_signal()
+        df['macd_hist']   = macd.macd_diff()
 
-        hl2           = (df['high'] + df['low']) / 2
-        df['st_upper']= hl2 + (3 * df['atr'])
-        df['st_lower']= hl2 - (3 * df['atr'])
-        df['supertrend'] = np.where(
-            df['close'] > df['st_upper'].shift(1),
-            df['st_lower'], df['st_upper']
-        )
+        stoch = ta.momentum.StochRSIIndicator(df['close'])
+        df['srsi_k'] = stoch.stochrsi_k()
+        df['srsi_d'] = stoch.stochrsi_d()
 
-        df['rsi']       = ta.momentum.RSIIndicator(df['close'], 14).rsi()
-        macd_ind        = ta.trend.MACD(df['close'])
-        df['macd']      = macd_ind.macd()
-        df['macd_signal'] = macd_ind.macd_signal()
-        df['macd_hist'] = macd_ind.macd_diff()
-        stoch           = ta.momentum.StochRSIIndicator(df['close'])
-        df['stoch_k']   = stoch.stochrsi_k()
-        df['stoch_d']   = stoch.stochrsi_d()
+        df['atr'] = ta.volatility.AverageTrueRange(
+            df['high'], df['low'], df['close']).average_true_range()
 
-        adx_ind        = ta.trend.ADXIndicator(df['high'], df['low'], df['close'])
-        df['adx']      = adx_ind.adx()
-        df['di_plus']  = adx_ind.adx_pos()
-        df['di_minus'] = adx_ind.adx_neg()
-        aroon          = ta.trend.AroonIndicator(df['high'], df['low'])
-        df['aroon']    = aroon.aroon_up() - aroon.aroon_down()
-        df['roc']      = ta.momentum.ROCIndicator(df['close'], 10).roc()
-
-        df['obv']      = ta.volume.OnBalanceVolumeIndicator(df['close'], df['volume']).on_balance_volume()
-        df['obv_ema']  = df['obv'].ewm(span=20).mean()
-        df['mfi']      = ta.volume.MFIIndicator(df['high'], df['low'], df['close'], df['volume']).money_flow_index()
-        df['cmf']      = ta.volume.ChaikinMoneyFlowIndicator(df['high'], df['low'], df['close'], df['volume']).chaikin_money_flow()
-        vol_sma        = df['volume'].rolling(20).mean()
-        df['vol_ratio']= df['volume'] / vol_sma
-
-        bb             = ta.volatility.BollingerBands(df['close'])
+        bb = ta.volatility.BollingerBands(df['close'], 20, 2)
         df['bb_upper'] = bb.bollinger_hband()
         df['bb_lower'] = bb.bollinger_lband()
-        df['bb_mid']   = bb.bollinger_mavg()
         df['bb_pband'] = bb.bollinger_pband()
-        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_mid']
 
-        tp             = (df['high'] + df['low'] + df['close']) / 3
-        df['vwap']     = (tp * df['volume']).cumsum() / df['volume'].cumsum()
-        df['vwap'].fillna(df['close'], inplace=True)
+        adx_i = ta.trend.ADXIndicator(df['high'], df['low'], df['close'])
+        df['adx']    = adx_i.adx()
+        df['di_pos'] = adx_i.adx_pos()
+        df['di_neg'] = adx_i.adx_neg()
 
-        df['bull_div'] = (
-            (df['low'] < df['low'].shift(1)) &
-            (df['rsi'] > df['rsi'].shift(1))
-        ).astype(int)
-        df['bear_div'] = (
-            (df['high'] > df['high'].shift(1)) &
-            (df['rsi'] < df['rsi'].shift(1))
-        ).astype(int)
+        df['cmf'] = ta.volume.ChaikinMoneyFlowIndicator(
+            df['high'], df['low'], df['close'], df['volume']).chaikin_money_flow()
+        df['mfi'] = ta.volume.MFIIndicator(
+            df['high'], df['low'], df['close'], df['volume']).money_flow_index()
+
+        df['vol_sma']   = df['volume'].rolling(20).mean()
+        df['vol_ratio'] = df['volume'] / df['vol_sma'].replace(0, np.nan)
+
+        tp_col = (df['high'] + df['low'] + df['close']) / 3
+        df['vwap'] = (tp_col * df['volume']).cumsum() / df['volume'].cumsum()
+
+        body = (df['close'] - df['open']).abs()
+        uw   = df['high'] - df[['open','close']].max(axis=1)
+        lw   = df[['open','close']].min(axis=1) - df['low']
+
         df['bull_engulf'] = (
             (df['close'].shift(1) < df['open'].shift(1)) &
             (df['close'] > df['open']) &
-            (df['open'] <= df['close'].shift(1)) &
-            (df['close'] >= df['open'].shift(1))
+            (df['close'] > df['open'].shift(1)) &
+            (df['open'] < df['close'].shift(1))
         ).astype(int)
+
         df['bear_engulf'] = (
             (df['close'].shift(1) > df['open'].shift(1)) &
             (df['close'] < df['open']) &
-            (df['open'] >= df['close'].shift(1)) &
-            (df['close'] <= df['open'].shift(1))
+            (df['close'] < df['open'].shift(1)) &
+            (df['open'] > df['close'].shift(1))
         ).astype(int)
+
+        df['bull_pin']     = ((lw > body*2.5) & (lw > uw*2)   & (df['close'] > df['open'])).astype(int)
+        df['bear_pin']     = ((uw > body*2.5) & (uw > lw*2)   & (df['close'] < df['open'])).astype(int)
+        df['hammer']       = ((lw > body*2.0) & (lw > uw*1.5)).astype(int)
+        df['shooting_star']= ((uw > body*2.0) & (uw > lw*1.5)).astype(int)
+
     except Exception as e:
         pass
     return df
 
-# ── SCORING ────────────────────────────────────────────────────────────────
 
-def score_candle(r4h, p4h, r1h, r_daily):
-    ls = ss = 0
-    lr = {}; sr = {}
+# ══════════════════════════════════════════════════════════════════════════
+#  SMC ENGINE  (identical to your live bot)
+# ══════════════════════════════════════════════════════════════════════════
 
-    macd_cross_bull = r4h['macd'] > r4h['macd_signal'] and p4h['macd'] <= p4h['macd_signal']
-    macd_cross_bear = r4h['macd'] < r4h['macd_signal'] and p4h['macd'] >= p4h['macd_signal']
-    macd_hist_bull  = r4h['macd_hist'] > 0 and r4h['macd_hist'] > p4h['macd_hist']
-    macd_hist_bear  = r4h['macd_hist'] < 0 and r4h['macd_hist'] < p4h['macd_hist']
-    vol_spike       = r4h['vol_ratio'] > 2.0
+class SMCEngine:
 
-    # DAILY TREND (8pts)
-    if r_daily['ema_9'] > r_daily['ema_21'] and r_daily['ema_21'] > r_daily['ema_50']:
-        ls += 4; lr['daily_uptrend'] = 4
-    elif r_daily['ema_9'] < r_daily['ema_21'] and r_daily['ema_21'] < r_daily['ema_50']:
-        ss += 4; sr['daily_downtrend'] = 4
+    def swing_highs_lows(self, df, left=4, right=4):
+        highs, lows = [], []
+        n = len(df)
+        for i in range(left, n - right):
+            hi = df['high'].iloc[i]; lo = df['low'].iloc[i]
+            if all(hi >= df['high'].iloc[i-left:i]) and all(hi >= df['high'].iloc[i+1:i+right+1]):
+                highs.append({'i': i, 'price': hi})
+            if all(lo <= df['low'].iloc[i-left:i]) and all(lo <= df['low'].iloc[i+1:i+right+1]):
+                lows.append({'i': i, 'price': lo})
+        return highs, lows
 
-    if r_daily['close'] > r_daily['ema_200']:
-        ls += 2; lr['above_200ema_daily'] = 2
-    elif r_daily['close'] < r_daily['ema_200']:
-        ss += 2; sr['below_200ema_daily'] = 2
+    def check_4h_hh_ll(self, df_4h, direction, lookback=HH_LL_LOOKBACK):
+        n = len(df_4h)
+        if n < lookback * 2:
+            return False, "Not enough 4H data"
+        recent = df_4h.iloc[-lookback:]
+        prior  = df_4h.iloc[-(lookback*2):-lookback]
+        if direction == 'LONG':
+            rh, ph = recent['high'].max(), prior['high'].max()
+            return (rh > ph), f"4H HH: {ph:.5f}→{rh:.5f}"
+        else:
+            rl, pl = recent['low'].min(), prior['low'].min()
+            return (rl < pl), f"4H LL: {pl:.5f}→{rl:.5f}"
 
-    if r_daily['rsi'] > 50 and r_daily['rsi'] < 70:
-        ls += 1; lr['daily_rsi_bull'] = 1
-    # NOTE: daily_rsi_bear REMOVED — v5 showed 30.7% WR, actively hurt SHORTs
-    # elif r_daily['rsi'] < 50 and r_daily['rsi'] > 30:
-    #     ss += 1; sr['daily_rsi_bear'] = 1
+    def detect_structure_break(self, df, highs, lows, lookback=STRUCTURE_LOOKBACK):
+        events = []
+        close = df['close']
+        n = len(df)
+        start = max(0, n - lookback - 15)
 
-    if r_daily['macd_hist'] > 0:
-        ls += 1; lr['daily_macd_bull'] = 1
-    elif r_daily['macd_hist'] < 0:
-        ss += 1; sr['daily_macd_bear'] = 1
+        for k in range(1, len(highs)):
+            ph = highs[k-1]; ch = highs[k]
+            if ch['i'] < start: continue
+            level = ph['price']
+            for j in range(ch['i'], min(ch['i'] + 10, n)):
+                if close.iloc[j] > level:
+                    kind = 'BOS_BULL' if ch['price'] > ph['price'] else 'MSS_BULL'
+                    events.append({'kind': kind, 'level': level, 'bar': j}); break
 
-    # 4H TREND (8pts)
-    if r4h['ema_9'] > r4h['ema_21'] and r4h['ema_21'] > r4h['ema_50']:
-        ls += 3; lr['4h_uptrend'] = 3
-    elif r4h['ema_9'] < r4h['ema_21'] and r4h['ema_21'] < r4h['ema_50']:
-        ss += 3; sr['4h_downtrend'] = 3
+        for k in range(1, len(lows)):
+            pl = lows[k-1]; cl = lows[k]
+            if cl['i'] < start: continue
+            level = pl['price']
+            for j in range(cl['i'], min(cl['i'] + 10, n)):
+                if close.iloc[j] < level:
+                    kind = 'BOS_BEAR' if cl['price'] < pl['price'] else 'MSS_BEAR'
+                    events.append({'kind': kind, 'level': level, 'bar': j}); break
 
-    if r4h['close'] > r4h['supertrend']:
-        ls += 2; lr['4h_supertrend_bull'] = 2
-    elif r4h['close'] < r4h['supertrend']:
-        ss += 2; sr['4h_supertrend_bear'] = 2
+        if not events: return None
+        latest = sorted(events, key=lambda x: x['bar'])[-1]
+        if latest['bar'] < n - lookback: return None
+        return latest
 
-    if r4h['close'] > r4h['vwap']:
-        ls += 1; lr['4h_above_vwap'] = 1
-    else:
-        ss += 1; sr['4h_below_vwap'] = 1
+    def find_order_blocks(self, df, direction, lookback=60):
+        obs = []
+        n = len(df)
+        start = max(2, n - lookback)
+        for i in range(start, n - 3):
+            c = df.iloc[i]
+            atr_local = df['atr'].iloc[i] if 'atr' in df.columns and not pd.isna(df['atr'].iloc[i]) else (c['high'] - c['low'])
+            min_impulse = atr_local * OB_IMPULSE_ATR_MULT
+            if direction == 'LONG':
+                if c['close'] >= c['open']: continue
+                fwd_high = df['high'].iloc[i+1:min(i+5, n)].max()
+                if fwd_high - c['low'] < min_impulse: continue
+                ob = {'top': max(c['open'], c['close']), 'bottom': c['low'],
+                      'mid': (max(c['open'], c['close']) + c['low']) / 2, 'bar': i}
+                ob_50 = (ob['top'] + ob['bottom']) / 2
+                if (df['close'].iloc[i+1:n] < ob_50).any(): continue
+                obs.append(ob)
+            else:
+                if c['close'] <= c['open']: continue
+                fwd_low = df['low'].iloc[i+1:min(i+5, n)].min()
+                if c['high'] - fwd_low < min_impulse: continue
+                ob = {'top': c['high'], 'bottom': min(c['open'], c['close']),
+                      'mid': (c['high'] + min(c['open'], c['close'])) / 2, 'bar': i}
+                ob_50 = (ob['top'] + ob['bottom']) / 2
+                if (df['close'].iloc[i+1:n] > ob_50).any(): continue
+                obs.append(ob)
+        obs.sort(key=lambda x: x['bar'], reverse=True)
+        return obs
 
-    if r4h['close'] > r4h['ema_200']:
-        ls += 2; lr['4h_above_200ema'] = 2
-    elif r4h['close'] < r4h['ema_200']:
-        ss += 2; sr['4h_below_200ema'] = 2
+    def price_in_ob(self, price, ob, tol=OB_TOLERANCE_PCT):
+        t = ob['top'] * tol
+        return (ob['bottom'] - t) <= price <= (ob['top'] + t)
 
-    # TREND STRENGTH / ADX (6pts)
-    adx = r4h['adx']
-    if adx > 35:
-        if r4h['di_plus'] > r4h['di_minus']: ls += 3; lr['adx_very_strong_up'] = 3
-        else:                                 ss += 3; sr['adx_very_strong_down'] = 3
-    elif adx > 25:
-        if r4h['di_plus'] > r4h['di_minus']: ls += 2; lr['adx_strong_up'] = 2
-        else:                                 ss += 2; sr['adx_strong_down'] = 2
+    def find_fvg(self, df, direction, lookback=25):
+        fvgs = []
+        n = len(df)
+        for i in range(max(1, n - lookback), n - 1):
+            prev = df.iloc[i-1]; nxt = df.iloc[i+1]
+            if direction == 'LONG' and prev['high'] < nxt['low']:
+                fvgs.append({'top': nxt['low'], 'bottom': prev['high'],
+                             'mid': (nxt['low'] + prev['high']) / 2, 'bar': i})
+            elif direction == 'SHORT' and prev['low'] > nxt['high']:
+                fvgs.append({'top': prev['low'], 'bottom': nxt['high'],
+                             'mid': (prev['low'] + nxt['high']) / 2, 'bar': i})
+        return fvgs
 
-    aroon = r4h['aroon']
-    if aroon > 60:    ls += 2; lr['aroon_up'] = 2
-    elif aroon < -60: ss += 2; sr['aroon_down'] = 2
-
-    roc = r4h['roc']
-    if roc > 5:    ls += 1; lr['roc_bull'] = 1
-    elif roc < -5: ss += 1; sr['roc_bear'] = 1
-
-    # MACD (6pts)
-    if macd_cross_bull:   ls += 4; lr['macd_cross_4h'] = 4
-    elif macd_hist_bull:  ls += 2; lr['macd_hist_expanding'] = 2
-    if macd_cross_bear:   ss += 4; sr['macd_cross_4h_bear'] = 4
-    elif macd_hist_bear:  ss += 2; sr['macd_hist_expanding_bear'] = 2
-
-    # RSI (4pts)
-    rsi = r4h['rsi']
-    if rsi < 35:    ls += 3; lr['rsi_4h_oversold'] = 3
-    elif rsi < 45:  ls += 2; lr['rsi_4h_low'] = 2
-    elif rsi < 55:  ls += 1; lr['rsi_4h_neutral_bull'] = 1
-    if rsi > 65:    ss += 3; sr['rsi_4h_overbought'] = 3
-    elif rsi > 55:  ss += 2; sr['rsi_4h_high'] = 2
-
-    # DIVERGENCE (5pts)
-    if r4h['bull_div']:   ls += 3; lr['4h_bull_div'] = 3
-    elif r4h['bear_div']: ss += 3; sr['4h_bear_div'] = 3
-    if r1h['bull_engulf']: ls += 2; lr['1h_bull_engulf'] = 2
-    elif r1h['bear_engulf']: ss += 2; sr['1h_bear_engulf'] = 2
-
-    # VOLUME (4pts)
-    if vol_spike:
-        if r4h['close'] > p4h['close']: ls += 3; lr['vol_spike_bull'] = 3
-        else:                           ss += 3; sr['vol_spike_bear'] = 3
-    if r4h['cmf'] > 0.1:    ls += 1; lr['cmf_buying'] = 1
-    elif r4h['cmf'] < -0.1: ss += 1; sr['cmf_selling'] = 1
-
-    # BB + MFI + STOCH (3pts)
-    if r4h['bb_width'] > 0.05:
-        if r4h['close'] > r4h['bb_mid']: ls += 1; lr['bb_breakout_up'] = 1
-        else:                             ss += 1; sr['bb_breakout_down'] = 1
-    if r4h['mfi'] < 25:   ls += 1; lr['mfi_oversold_4h'] = 1
-    elif r4h['mfi'] > 75: ss += 1; sr['mfi_overbought_4h'] = 1
-    stoch_k = r4h['stoch_k']; stoch_d = r4h['stoch_d']
-    if stoch_k < 0.2 and stoch_k > stoch_d:   ls += 1; lr['stoch_bull'] = 1
-    elif stoch_k > 0.8 and stoch_k < stoch_d: ss += 1; sr['stoch_bear'] = 1
-
-    return ls, ss, lr, sr
-
-# ── REGIME CHECK ───────────────────────────────────────────────────────────
-
-def check_regime(r_daily, r4h, direction):
-    daily_bull = r_daily['ema_9'] > r_daily['ema_21']
-    daily_bear = r_daily['ema_9'] < r_daily['ema_21']
-    h4_bull    = r4h['ema_9'] > r4h['ema_21']
-    h4_bear    = r4h['ema_9'] < r4h['ema_21']
-    if direction == 'LONG':
-        return daily_bull and h4_bull
-    else:
-        return daily_bear and h4_bear
-
-# ── TRADE SIMULATION v4 — TRAILING STOP ───────────────────────────────────
-
-def simulate_trade(idx, df_4h, direction, entry, sl, tp1, tp2=None):
-    """
-    v4 Trailing Stop Simulation:
-      Phase 1: Hard SL until TP1 hit
-      Phase 2: After TP1, trail stop at TRAIL_ATR_MULT * atr below/above peak
-               Ride until trailing stop triggers or timeout
-    
-    tp2 param kept for signature compat but ignored.
-    """
-    max_candles = MAX_TRADE_DAYS * 6
-    future = df_4h.iloc[idx+1 : idx+1+max_candles]
-
-    if len(future) == 0:
+    def recent_liquidity_sweep(self, df, direction, highs, lows, lookback=25):
+        n = len(df)
+        start = n - lookback
+        if direction == 'LONG':
+            for sl in reversed(lows):
+                if sl['i'] < start: continue
+                level = sl['price']
+                for j in range(sl['i'] + 1, min(sl['i'] + 8, n)):
+                    c = df.iloc[j]
+                    if c['low'] < level and c['close'] > level:
+                        return {'level': level, 'bar': j, 'type': 'SWEEP_LOW'}
+        else:
+            for sh in reversed(highs):
+                if sh['i'] < start: continue
+                level = sh['price']
+                for j in range(sh['i'] + 1, min(sh['i'] + 8, n)):
+                    c = df.iloc[j]
+                    if c['high'] > level and c['close'] < level:
+                        return {'level': level, 'bar': j, 'type': 'SWEEP_HIGH'}
         return None
 
-    # Compute ATR at signal candle
-    atr_at_entry = df_4h.iloc[idx].get('atr', abs(entry * 0.03))
-    trail_dist = TRAIL_ATR_MULT * atr_at_entry
+    def pd_zone(self, df_4h, price):
+        hi = df_4h['high'].iloc[-50:].max()
+        lo = df_4h['low'].iloc[-50:].min()
+        rang = hi - lo
+        if rang == 0: return 'NEUTRAL', 0.5
+        pos = (price - lo) / rang
+        if pos < 0.40:   return 'DISCOUNT', pos
+        elif pos > 0.60: return 'PREMIUM',  pos
+        return 'NEUTRAL', pos
 
-    tp1_hit = False
-    peak    = entry  # best price seen since TP1
-    trail_stop = None
 
-    for i, (_, candle) in enumerate(future.iterrows()):
-        hi = candle['high']
-        lo = candle['low']
-        close_ts = candle['ts']
+# ══════════════════════════════════════════════════════════════════════════
+#  SCORER  (identical to your live bot)
+# ══════════════════════════════════════════════════════════════════════════
 
-        if direction == 'LONG':
-            if not tp1_hit:
-                # Phase 1: hard SL
-                if lo <= sl:
-                    loss = (sl - entry) / entry * 100
-                    return {'outcome': 'SL', 'pnl': -abs(loss), 'tp1_pnl': 0, 'tp2_pnl': 0, 'close_ts': close_ts}
-                if hi >= tp1:
-                    tp1_hit  = True
-                    peak     = max(hi, tp1)
-                    trail_stop = peak - trail_dist
-            else:
-                # Phase 2: trailing stop
-                if hi > peak:
-                    peak = hi
-                    trail_stop = peak - trail_dist
-                if lo <= trail_stop:
-                    tp1_gain  = (tp1  - entry) / entry * 100
-                    exit_gain = (trail_stop - entry) / entry * 100
-                    blended   = tp1_gain * TP1_POSITION_PCT + exit_gain * (1 - TP1_POSITION_PCT)
-                    outcome   = 'TRAIL' if exit_gain > 0 else 'BE'
-                    return {'outcome': outcome, 'pnl': blended,
-                            'tp1_pnl': tp1_gain, 'tp2_pnl': exit_gain, 'close_ts': close_ts}
+def score_setup(direction, ob, structure, sweep, fvg_near,
+                df_1h, df_15m, df_4h, pd_label, hh_ll_confirmed):
+    score = 0
+    reasons = []
+    failed  = []
 
-        else:  # SHORT
-            if not tp1_hit:
-                if hi >= sl:
-                    loss = (entry - sl) / entry * 100
-                    return {'outcome': 'SL', 'pnl': -abs(loss), 'tp1_pnl': 0, 'tp2_pnl': 0, 'close_ts': close_ts}
-                if lo <= tp1:
-                    tp1_hit  = True
-                    peak     = min(lo, tp1)
-                    trail_stop = peak + trail_dist
-            else:
-                if lo < peak:
-                    peak = lo
-                    trail_stop = peak + trail_dist
-                if hi >= trail_stop:
-                    tp1_gain  = (entry - tp1) / entry * 100
-                    exit_gain = (entry - trail_stop) / entry * 100
-                    blended   = tp1_gain * TP1_POSITION_PCT + exit_gain * (1 - TP1_POSITION_PCT)
-                    outcome   = 'TRAIL' if exit_gain > 0 else 'BE'
-                    return {'outcome': outcome, 'pnl': blended,
-                            'tp1_pnl': tp1_gain, 'tp2_pnl': exit_gain, 'close_ts': close_ts}
+    l1  = df_1h.iloc[-1]
+    p1  = df_1h.iloc[-2]
+    l15 = df_15m.iloc[-1]
+    l4  = df_4h.iloc[-1]
 
-    # Timeout
-    close_ts = future.iloc[-1]['ts'] if len(future) > 0 else None
-    if tp1_hit:
-        tp1_gain = abs(tp1 - entry) / entry * 100
-        # Exit at last candle close
-        last_close = future.iloc[-1]['close']
-        if direction == 'LONG':
-            exit_gain = (last_close - entry) / entry * 100
+    # 1. Structure (20)
+    if structure:
+        if 'MSS' in structure['kind']:
+            score += 20; reasons.append(f"MSS({structure['kind']})")
         else:
-            exit_gain = (entry - last_close) / entry * 100
-        blended = tp1_gain * TP1_POSITION_PCT + exit_gain * (1 - TP1_POSITION_PCT)
-        return {'outcome': 'TIMEOUT_TP1', 'pnl': blended,
-                'tp1_pnl': tp1_gain, 'tp2_pnl': exit_gain, 'close_ts': close_ts}
-    return {'outcome': 'TIMEOUT', 'pnl': 0, 'tp1_pnl': 0, 'tp2_pnl': 0, 'close_ts': close_ts}
+            score += 14; reasons.append(f"BOS({structure['kind']})")
+    else:
+        failed.append("No BOS/MSS")
+
+    # 2. OB quality (20)
+    if ob:
+        ob_size_pct = (ob['top'] - ob['bottom']) / ob['bottom'] * 100
+        if ob_size_pct < 0.8:
+            score += 20; reasons.append(f"TightOB({ob_size_pct:.2f}%)")
+        elif ob_size_pct < 2.0:
+            score += 13; reasons.append(f"OB({ob_size_pct:.2f}%)")
+        else:
+            score += 7;  reasons.append(f"WideOB({ob_size_pct:.2f}%)")
+    else:
+        failed.append("No OB")
+
+    # 3. 4H Trend (15)
+    e21 = l4.get('ema_21', 0); e50 = l4.get('ema_50', 0); e200 = l4.get('ema_200', 0)
+    if direction == 'LONG':
+        if e21 > e50 > e200:   score += 15; reasons.append("4H_TripleBull")
+        elif e21 > e50:         score += 10; reasons.append("4H_Bull21>50")
+        elif pd_label == 'DISCOUNT': score += 6; reasons.append("4H_Discount")
+        else: failed.append("4H_WeakLong")
+    else:
+        if e21 < e50 < e200:   score += 15; reasons.append("4H_TripleBear")
+        elif e21 < e50:         score += 10; reasons.append("4H_Bear21<50")
+        elif pd_label == 'PREMIUM': score += 6; reasons.append("4H_Premium")
+        else: failed.append("4H_WeakShort")
+
+    # 4. HH/LL bonus (8)
+    if hh_ll_confirmed:
+        score += HH_LL_BONUS; reasons.append("HH_LL_OK")
+    else:
+        failed.append("No_HH_LL")
+
+    # 5. 1H Trigger (25)
+    trigger = False; trigger_label = ""; trigger_pts = 0
+    if direction == 'LONG':
+        if l1.get('bull_engulf', 0):  pts=25; lbl="1H_BullEngulf_cur"
+        elif l1.get('bull_pin',0):     pts=22; lbl="1H_BullPin_cur"
+        elif l1.get('hammer',0):       pts=18; lbl="1H_Hammer_cur"
+        elif p1.get('bull_engulf',0):  pts=14; lbl="1H_BullEngulf_prev"
+        elif p1.get('bull_pin',0):     pts=11; lbl="1H_BullPin_prev"
+        elif p1.get('hammer',0):       pts=9;  lbl="1H_Hammer_prev"
+        else: pts=0; lbl=""
+    else:
+        if l1.get('bear_engulf', 0):   pts=25; lbl="1H_BearEngulf_cur"
+        elif l1.get('bear_pin',0):      pts=22; lbl="1H_BearPin_cur"
+        elif l1.get('shooting_star',0): pts=18; lbl="1H_ShootingStar_cur"
+        elif p1.get('bear_engulf',0):   pts=14; lbl="1H_BearEngulf_prev"
+        elif p1.get('bear_pin',0):      pts=11; lbl="1H_BearPin_prev"
+        elif p1.get('shooting_star',0): pts=9;  lbl="1H_ShootStar_prev"
+        else: pts=0; lbl=""
+
+    if pts > 0:
+        score += pts; trigger = True; trigger_label = lbl; trigger_pts = pts
+        reasons.append(lbl)
+    else:
+        score -= 12; failed.append("No_1H_Trigger")
+
+    # 6. Momentum (12)
+    rsi1  = l1.get('rsi', 50)
+    macd1 = l1.get('macd', 0);  ms1  = l1.get('macd_signal', 0)
+    pm1   = p1.get('macd', 0);  pms1 = p1.get('macd_signal', 0)
+    sk1   = l1.get('srsi_k', 0.5); sd1 = l1.get('srsi_d', 0.5)
+    if direction == 'LONG':
+        if 28 <= rsi1 <= 55:     score += 4; reasons.append(f"RSI_reset({rsi1:.0f})")
+        elif rsi1 < 28:           score += 3; reasons.append(f"RSI_OS({rsi1:.0f})")
+        if macd1 > ms1 and pm1 <= pms1: score += 5; reasons.append("MACD_BCross")
+        elif macd1 > ms1:                score += 2; reasons.append("MACD_Bull")
+        if sk1 < 0.3 and sk1 > sd1:     score += 3; reasons.append("Stoch_BCross")
+    else:
+        if 45 <= rsi1 <= 72:     score += 4; reasons.append(f"RSI_OB_zone({rsi1:.0f})")
+        elif rsi1 > 72:           score += 3; reasons.append(f"RSI_OB({rsi1:.0f})")
+        if macd1 < ms1 and pm1 >= pms1: score += 5; reasons.append("MACD_BearCross")
+        elif macd1 < ms1:                score += 2; reasons.append("MACD_Bear")
+        if sk1 > 0.7 and sk1 < sd1:     score += 3; reasons.append("Stoch_BearCross")
+
+    # 7. Extras (10 max)
+    extras = 0
+    if sweep:  extras += 4; reasons.append("Sweep")
+    if fvg_near: extras += 3; reasons.append("FVG_OB_overlap")
+    vr15 = l15.get('vol_ratio', 1.0)
+    if   vr15 >= 2.5: extras += 3; reasons.append(f"15M_VolSpike({vr15:.1f}x)")
+    elif vr15 >= 1.5: extras += 1; reasons.append(f"15M_Vol({vr15:.1f}x)")
+    close1 = l1.get('close', 0); vwap1 = l1.get('vwap', 0)
+    if direction == 'LONG' and close1 < vwap1:   extras += 1; reasons.append("BelowVWAP")
+    elif direction == 'SHORT' and close1 > vwap1: extras += 1; reasons.append("AboveVWAP")
+    score += min(extras, 10)
+
+    return max(0, min(int(score), 100)), reasons, failed, trigger_label, trigger_pts
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  ANALYSE  (identical logic to your live bot, returns richer debug dict)
+# ══════════════════════════════════════════════════════════════════════════
 
-# ── MAIN ───────────────────────────────────────────────────────────────────
+_smc = SMCEngine()
 
-async def run_backtest():
-    exchange = ccxt.binance({'options': {'defaultType': 'future'}, 'enableRateLimit': True})
+def analyse_slice(data: dict, symbol: str):
+    """
+    data = {'4h': df, '1h': df, '15m': df}  — sliced up to current bar
+    Returns (signal_dict | None, debug_dict)
+    """
+    debug = {'symbol': symbol, 'score': 0, 'bias': '?', 'reject_reason': '', 'gates': []}
 
-    print(f"""
-╔══════════════════════════════════════════════════════╗
-║           SWING BOT BACKTEST v8.0                   ║
-║  {LOOKBACK_DAYS}d | {TOP_N_PAIRS} pairs | score≥{MIN_SCORE_PCT*100:.0f}% | ADX≥{ADX_MIN} | HARD
-║  TP1={ATR_TP1_MULT}x ATR (40%) | TRAIL={TRAIL_ATR_MULT}x ATR | SL={ATR_SL_MULT}x ATR
-║  LONG_BULL_ONLY={LONG_BULL_ONLY} | tighter SL | ADX≥30
-╚══════════════════════════════════════════════════════╝
-""")
+    try:
+        df4  = data['4h']
+        df1  = data['1h']
+        df15 = data['15m']
 
-    # Load pairs
-    logger.info("Loading pairs...")
-    markets = await exchange.load_markets()
-    tickers = await exchange.fetch_tickers()
-    pairs = []
-    for sym, mkt in markets.items():
-        if not (mkt.get('swap') and mkt.get('quote') == 'USDT' and mkt.get('active')):
-            continue
-        vol = (tickers.get(sym, {}).get('quoteVolume') or 0)
-        if vol >= MIN_VOLUME_USDT:
-            pairs.append((sym, vol))
-    pairs.sort(key=lambda x: x[1], reverse=True)
-    pairs = [p[0] for p in pairs[:TOP_N_PAIRS]]
-    logger.info(f"✅ {len(pairs)} pairs loaded")
+        if len(df1) < MIN_WARMUP_BARS or len(df15) < 40 or len(df4) < 55:
+            debug['reject_reason'] = 'not_enough_data'
+            return None, debug
 
-    # BTC daily regime per candle
-    btc_raw   = await exchange.fetch_ohlcv('BTC/USDT:USDT', '1d', limit=LOOKBACK_DAYS+10)
-    btc_daily = pd.DataFrame(btc_raw, columns=['ts','open','high','low','close','volume'])
-    btc_daily['ts'] = pd.to_datetime(btc_daily['ts'], unit='ms')
-    btc_daily = add_indicators(btc_daily)
-    btc_daily['btc_bull'] = btc_daily['ema_9'] > btc_daily['ema_21']
-    bull_days = int(btc_daily['btc_bull'].sum())
-    bear_days = int((~btc_daily['btc_bull']).sum())
-    logger.info(f"  BULL: {bull_days} days | BEAR: {bear_days} days")
+        price = df1['close'].iloc[-1]
 
-    thresh          = MAX_SCORE * MIN_SCORE_PCT
-    premium_thresh  = MAX_SCORE * QUALITY_PREMIUM
-    limit_4h        = LOOKBACK_DAYS * 6 + 250    # extra for indicators warmup
-    limit_daily     = LOOKBACK_DAYS + 100
+        # Gate 1: 4H bias
+        l4  = df4.iloc[-1]
+        e21 = l4.get('ema_21', 0); e50 = l4.get('ema_50', 0)
+        if e21 > e50:      bias = 'LONG'
+        elif e21 < e50:    bias = 'SHORT'
+        else:
+            debug['reject_reason'] = 'flat_4h_ema'
+            return None, debug
+        debug['bias'] = bias
 
-    all_signals = []
-    stats = {
-        'regime_blocked': 0,
-        'adx_blocked'   : 0,
-        'cooldown_skip' : 0,
-    }
+        hh_ll_ok, _ = _smc.check_4h_hh_ll(df4, bias, HH_LL_LOOKBACK)
 
-    for i, symbol in enumerate(pairs):
+        # Gate 2: PD zone
+        pd_label, pd_pos = _smc.pd_zone(df4, price)
+        if bias == 'LONG' and pd_label == 'PREMIUM':
+            debug['reject_reason'] = 'pd_premium_no_long'
+            return None, debug
+        if bias == 'SHORT' and pd_label == 'DISCOUNT':
+            debug['reject_reason'] = 'pd_discount_no_short'
+            return None, debug
+
+        # Gate 3: 1H Structure
+        highs1, lows1 = _smc.swing_highs_lows(df1, 4, 4)
+        structure = _smc.detect_structure_break(df1, highs1, lows1, STRUCTURE_LOOKBACK)
+        if structure:
+            if bias == 'LONG' and 'BEAR' in structure['kind']:
+                debug['reject_reason'] = 'structure_opposes_long'
+                return None, debug
+            if bias == 'SHORT' and 'BULL' in structure['kind']:
+                debug['reject_reason'] = 'structure_opposes_short'
+                return None, debug
+
+        # Gate 4: 1H OB
+        obs = _smc.find_order_blocks(df1, bias, lookback=60)
+        if not obs:
+            debug['reject_reason'] = 'no_ob_found'
+            return None, debug
+
+        active_ob = None
+        for ob in obs:
+            if _smc.price_in_ob(price, ob, OB_TOLERANCE_PCT):
+                active_ob = ob; break
+        if not active_ob:
+            debug['reject_reason'] = 'price_not_at_ob'
+            return None, debug
+
+        # FVG + Sweep (bonuses)
+        fvgs = _smc.find_fvg(df1, bias, lookback=25)
+        fvg_near = None
+        for fvg in fvgs:
+            if fvg['bottom'] < active_ob['top'] and fvg['top'] > active_ob['bottom']:
+                fvg_near = fvg; break
+        sweep = _smc.recent_liquidity_sweep(df1, bias, highs1, lows1, lookback=20)
+
+        # Score
+        score, reasons, failed, trigger_label, trigger_pts = score_setup(
+            bias, active_ob, structure, sweep, fvg_near,
+            df1, df15, df4, pd_label, hh_ll_ok
+        )
+        debug['score'] = score
+        debug['bias']  = bias
+
+        if score < MIN_SCORE:
+            debug['reject_reason'] = f'score_{score}_below_{MIN_SCORE}'
+            return None, debug
+
+        if   score >= 92: quality = 'ELITE'
+        elif score >= 85: quality = 'PREMIUM'
+        else:             quality = 'HIGH'
+
+        atr1  = df1['atr'].iloc[-1]
+        entry = price
+
+        if bias == 'LONG':
+            sl  = min(active_ob['bottom'] - atr1 * 0.2, entry - atr1 * 0.6)
+        else:
+            sl  = max(active_ob['top'] + atr1 * 0.2, entry + atr1 * 0.6)
+
+        risk = abs(entry - sl)
+        if risk < entry * 0.001:
+            debug['reject_reason'] = 'degenerate_sl'
+            return None, debug
+
+        if bias == 'LONG':
+            tps = [entry + risk*1.5, entry + risk*2.5, entry + risk*4.0]
+        else:
+            tps = [entry - risk*1.5, entry - risk*2.5, entry - risk*4.0]
+
+        # Extra metadata for backtest analysis
+        ob_size_pct = (active_ob['top'] - active_ob['bottom']) / active_ob['bottom'] * 100
+        adx_val     = df1.iloc[-1].get('adx', 0)
+        rsi_val     = df1.iloc[-1].get('rsi', 50)
+        vol_ratio   = df1.iloc[-1].get('vol_ratio', 1.0)
+
+        sig = {
+            'symbol':        symbol.replace('/USDT:USDT',''),
+            'full_symbol':   symbol,
+            'signal':        bias,
+            'quality':       quality,
+            'score':         score,
+            'hh_ll':         hh_ll_ok,
+            'entry':         entry,
+            'stop_loss':     sl,
+            'tp1':           tps[0],
+            'tp2':           tps[1],
+            'tp3':           tps[2],
+            'risk_pct':      risk / entry * 100,
+            'rr1':           1.5,
+            'rr2':           2.5,
+            'rr3':           4.0,
+            'pd_zone':       pd_label,
+            'pd_pos':        round(pd_pos, 3),
+            'structure_kind':structure['kind'] if structure else 'none',
+            'has_sweep':     sweep is not None,
+            'has_fvg':       fvg_near is not None,
+            'trigger':       trigger_label,
+            'trigger_pts':   trigger_pts,
+            'ob_size_pct':   round(ob_size_pct, 3),
+            'adx':           round(adx_val, 1) if not pd.isna(adx_val) else 0,
+            'rsi':           round(rsi_val, 1) if not pd.isna(rsi_val) else 50,
+            'vol_ratio_1h':  round(vol_ratio, 2) if not pd.isna(vol_ratio) else 1.0,
+            'reasons':       '|'.join(reasons),
+            'failed':        '|'.join(failed),
+            'bar_time':      df1.iloc[-1]['ts'],
+            # placeholders — filled by walk-forward simulator
+            'outcome':       None,   # TP1/TP2/TP3/SL/TIMEOUT
+            'bars_to_exit':  None,
+            'pnl_rr':        None,
+            'exit_price':    None,
+        }
+        return sig, debug
+
+    except Exception as e:
+        debug['reject_reason'] = f'exception:{e}'
+        return None, debug
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  DATA  DOWNLOADER  (with local cache)
+# ══════════════════════════════════════════════════════════════════════════
+
+async def download_ohlcv(exchange, symbol: str, tf: str,
+                         since_ms: int, until_ms: int) -> pd.DataFrame:
+    cache_key = symbol.replace('/', '_').replace(':', '_')
+    cache_path = CACHE_DIR / f"{cache_key}_{tf}.parquet"
+
+    if cache_path.exists():
+        df = pd.read_parquet(cache_path)
+        # check coverage
+        if not df.empty:
+            need_more = df['ts'].iloc[-1] < pd.Timestamp(until_ms, unit='ms', tz='UTC') - pd.Timedelta(hours=4)
+            if not need_more:
+                mask = (df['ts'] >= pd.Timestamp(since_ms, unit='ms', tz='UTC')) & \
+                       (df['ts'] <= pd.Timestamp(until_ms, unit='ms', tz='UTC'))
+                return df[mask].reset_index(drop=True)
+
+    all_rows = []
+    cur = since_ms
+    limit = 1000
+    while cur < until_ms:
         try:
-            # Fetch all TFs
-            raw_4h    = await exchange.fetch_ohlcv(symbol, '4h',  limit=limit_4h)
-            raw_1h    = await exchange.fetch_ohlcv(symbol, '1h',  limit=LOOKBACK_DAYS*24+50)
-            raw_daily = await exchange.fetch_ohlcv(symbol, '1d',  limit=limit_daily)
+            raw = await exchange.fetch_ohlcv(symbol, tf, since=cur, limit=limit)
+            if not raw: break
+            all_rows.extend(raw)
+            cur = raw[-1][0] + 1
+            await asyncio.sleep(0.12)
+            if raw[-1][0] >= until_ms: break
+        except Exception as e:
+            print(f"  ⚠  {symbol} {tf}: {e}")
+            await asyncio.sleep(2)
+            break
 
-            if not raw_4h or not raw_1h or not raw_daily:
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows, columns=['ts','open','high','low','close','volume'])
+    df['ts'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
+    df.drop_duplicates('ts', inplace=True)
+    df.sort_values('ts', inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_path, index=False)
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  WALK-FORWARD SIMULATOR
+# ══════════════════════════════════════════════════════════════════════════
+
+def simulate_trade_outcome(signal: dict, df1_future: pd.DataFrame) -> dict:
+    """
+    Given a signal and the 1H bars AFTER entry, walk forward and find
+    the first of: TP1 / TP2 / TP3 / SL to be touched (high/low).
+    Returns updated signal dict with outcome fields filled.
+    """
+    s   = signal
+    sig = s['signal']
+
+    for i, row in df1_future.iterrows():
+        h, l = row['high'], row['low']
+        bars = i + 1
+
+        if sig == 'LONG':
+            # SL check first (conservative — if same bar both hit, SL wins)
+            if l <= s['stop_loss']:
+                s['outcome']      = 'SL'
+                s['bars_to_exit'] = bars
+                s['exit_price']   = s['stop_loss']
+                s['pnl_rr']       = -1.0
+                return s
+            if h >= s['tp3']:
+                s['outcome'] = 'TP3'; s['exit_price'] = s['tp3']; s['pnl_rr'] = 4.0
+            elif h >= s['tp2']:
+                s['outcome'] = 'TP2'; s['exit_price'] = s['tp2']; s['pnl_rr'] = 2.5
+            elif h >= s['tp1']:
+                s['outcome'] = 'TP1'; s['exit_price'] = s['tp1']; s['pnl_rr'] = 1.5
+        else:
+            if h >= s['stop_loss']:
+                s['outcome']      = 'SL'
+                s['bars_to_exit'] = bars
+                s['exit_price']   = s['stop_loss']
+                s['pnl_rr']       = -1.0
+                return s
+            if l <= s['tp3']:
+                s['outcome'] = 'TP3'; s['exit_price'] = s['tp3']; s['pnl_rr'] = 4.0
+            elif l <= s['tp2']:
+                s['outcome'] = 'TP2'; s['exit_price'] = s['tp2']; s['pnl_rr'] = 2.5
+            elif l <= s['tp1']:
+                s['outcome'] = 'TP1'; s['exit_price'] = s['tp1']; s['pnl_rr'] = 1.5
+
+        if s['outcome'] not in (None, 'SL'):
+            s['bars_to_exit'] = bars
+            return s
+
+    # timed out
+    last_price        = df1_future.iloc[-1]['close'] if not df1_future.empty else s['entry']
+    s['outcome']      = 'TIMEOUT'
+    s['bars_to_exit'] = len(df1_future)
+    s['exit_price']   = last_price
+    pnl               = (last_price - s['entry']) / s['entry'] * 100
+    s['pnl_rr']       = (last_price - s['entry']) / abs(s['entry'] - s['stop_loss']) \
+                        if sig == 'LONG' else \
+                        (s['entry'] - last_price) / abs(s['stop_loss'] - s['entry'])
+    return s
+
+
+def resample_to_tf(df_1h: pd.DataFrame, target_tf: str) -> pd.DataFrame:
+    """Resample 1H data to 4H or 15M approximately for slice alignment."""
+    # This is used only during the walk-forward to create aligned 4H/15M slices
+    # from the master 1H index.  In practice we keep separate downloaded DFs.
+    return df_1h  # placeholder — actual slicing is done below
+
+
+def walk_forward_pair(symbol: str, df4: pd.DataFrame,
+                      df1: pd.DataFrame, df15: pd.DataFrame) -> list:
+    """
+    Walk forward bar by bar on 1H, apply analyse_slice(), simulate outcomes.
+    Returns list of trade dicts.
+    """
+    trades = []
+    n1     = len(df1)
+    # Deduplicate bar times to avoid signal spam at same candle
+    active_signal_bar = -99  # last bar index where a signal was fired
+
+    for bar_i in range(MIN_WARMUP_BARS, n1 - MAX_TRADE_BARS - 1):
+        # ── Slice data up to current bar (no lookahead) ────────────────
+        df1_slice = add_indicators(df1.iloc[:bar_i+1].copy())
+        cur_ts    = df1_slice.iloc[-1]['ts']
+
+        # Align 4H slice: all 4H bars whose open time <= cur_ts
+        df4_slice_raw = df4[df4['ts'] <= cur_ts]
+        if len(df4_slice_raw) < 55:
+            continue
+        df4_slice = add_indicators(df4_slice_raw.copy())
+
+        # Align 15M slice: last 80 bars up to cur_ts
+        df15_slice_raw = df15[df15['ts'] <= cur_ts].iloc[-80:]
+        if len(df15_slice_raw) < 40:
+            continue
+        df15_slice = add_indicators(df15_slice_raw.copy())
+
+        data = {'4h': df4_slice, '1h': df1_slice, '15m': df15_slice}
+        sig, debug = analyse_slice(data, symbol)
+
+        if sig is None:
+            continue
+
+        # Deduplicate: don't fire on same bar twice
+        if bar_i == active_signal_bar:
+            continue
+        active_signal_bar = bar_i
+
+        # ── Simulate outcome on forward bars ──────────────────────────
+        future_bars = df1.iloc[bar_i+1 : bar_i+1+MAX_TRADE_BARS].reset_index(drop=True)
+        sig = simulate_trade_outcome(sig, future_bars)
+        trades.append(sig)
+
+    return trades
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  STATISTICS ENGINE
+# ══════════════════════════════════════════════════════════════════════════
+
+def compute_stats(trades: list) -> dict:
+    if not trades:
+        return {}
+
+    df = pd.DataFrame(trades)
+
+    total  = len(df)
+    wins   = df['outcome'].isin(['TP1','TP2','TP3']).sum()
+    losses = (df['outcome'] == 'SL').sum()
+    timeouts = (df['outcome'] == 'TIMEOUT').sum()
+
+    winrate = wins / total * 100 if total else 0
+    avg_rr  = df['pnl_rr'].mean()
+    avg_rr_wins   = df[df['pnl_rr'] > 0]['pnl_rr'].mean()
+    avg_rr_losses = df[df['pnl_rr'] < 0]['pnl_rr'].mean()
+
+    tp1_rate = (df['outcome']=='TP1').sum() / total * 100
+    tp2_rate = (df['outcome']=='TP2').sum() / total * 100
+    tp3_rate = (df['outcome']=='TP3').sum() / total * 100
+    sl_rate  = (df['outcome']=='SL').sum()  / total * 100
+
+    # expectancy (per trade, in RR units)
+    expectancy = winrate/100 * avg_rr_wins + (1 - winrate/100) * (avg_rr_losses if not pd.isna(avg_rr_losses) else -1)
+
+    # ── Break down by variable ─────────────────────────────────────────
+    def breakdown(col, label):
+        if col not in df.columns:
+            return {}
+        result = {}
+        for val in df[col].unique():
+            sub = df[df[col] == val]
+            w   = sub['outcome'].isin(['TP1','TP2','TP3']).sum()
+            result[str(val)] = {
+                'count':   len(sub),
+                'winrate': round(w/len(sub)*100, 1),
+                'avg_rr':  round(sub['pnl_rr'].mean(), 2),
+                'label':   label
+            }
+        return dict(sorted(result.items(), key=lambda x: -x[1]['winrate']))
+
+    # Score buckets
+    df['score_bucket'] = pd.cut(df['score'],
+                                bins=[74,79,84,89,94,100],
+                                labels=['75-79','80-84','85-89','90-94','95-100'])
+
+    # ADX buckets
+    df['adx_bucket'] = pd.cut(df['adx'],
+                               bins=[0,20,30,40,60,200],
+                               labels=['<20','20-30','30-40','40-60','>60'])
+
+    # OB size buckets
+    df['ob_bucket'] = pd.cut(df['ob_size_pct'],
+                              bins=[0,0.5,0.8,1.5,2.0,10],
+                              labels=['<0.5%','0.5-0.8%','0.8-1.5%','1.5-2%','>2%'])
+
+    stats = {
+        'total':      total,
+        'wins':       int(wins),
+        'losses':     int(losses),
+        'timeouts':   int(timeouts),
+        'winrate':    round(winrate, 1),
+        'tp1_rate':   round(tp1_rate, 1),
+        'tp2_rate':   round(tp2_rate, 1),
+        'tp3_rate':   round(tp3_rate, 1),
+        'sl_rate':    round(sl_rate, 1),
+        'avg_rr':     round(avg_rr, 3),
+        'avg_rr_wins':round(avg_rr_wins, 3)  if not pd.isna(avg_rr_wins) else 0,
+        'avg_rr_loss':round(avg_rr_losses,3) if not pd.isna(avg_rr_losses) else 0,
+        'expectancy': round(expectancy, 3),
+        'avg_bars':   round(df['bars_to_exit'].mean(), 1),
+        'by_quality': breakdown('quality', 'Quality'),
+        'by_signal':  breakdown('signal',  'Direction'),
+        'by_pd_zone': breakdown('pd_zone', 'PD Zone'),
+        'by_structure': breakdown('structure_kind', 'Structure'),
+        'by_trigger': breakdown('trigger', 'Trigger Candle'),
+        'by_hh_ll':   breakdown('hh_ll',   'HH/LL'),
+        'by_sweep':   breakdown('has_sweep','Liq Sweep'),
+        'by_fvg':     breakdown('has_fvg',  'FVG Overlap'),
+        'by_score':   breakdown('score_bucket','Score Bucket'),
+        'by_adx':     breakdown('adx_bucket', 'ADX'),
+        'by_ob_size': breakdown('ob_bucket',  'OB Size'),
+        'by_symbol':  breakdown('symbol',     'Pair'),
+    }
+    return stats, df
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  HTML REPORT GENERATOR
+# ══════════════════════════════════════════════════════════════════════════
+
+def generate_html_report(stats: dict, trades_df: pd.DataFrame,
+                         date_from: str, date_to: str,
+                         pairs_tested: list) -> str:
+
+    def pct_color(val):
+        if val >= 60: return '#00c853'
+        if val >= 50: return '#ffd600'
+        return '#ff1744'
+
+    def rr_color(val):
+        if val >= 1.0: return '#00c853'
+        if val >= 0: return '#ffd600'
+        return '#ff1744'
+
+    def breakdown_table(title, d):
+        if not d: return ''
+        rows = ''
+        for k, v in d.items():
+            wr = v['winrate']
+            rr = v['avg_rr']
+            rows += f"""<tr>
+              <td>{k}</td>
+              <td>{v['count']}</td>
+              <td style="color:{pct_color(wr)};font-weight:bold">{wr}%</td>
+              <td style="color:{rr_color(rr)};font-weight:bold">{rr}</td>
+            </tr>"""
+        return f"""
+        <div class="card">
+          <h3>🔍 {title}</h3>
+          <table>
+            <tr><th>Value</th><th>Trades</th><th>Win%</th><th>Avg RR</th></tr>
+            {rows}
+          </table>
+        </div>"""
+
+    # Outcome chart data
+    outcomes      = trades_df['outcome'].value_counts().to_dict()
+    monthly       = trades_df.copy()
+    monthly['month'] = pd.to_datetime(monthly['bar_time']).dt.to_period('M').astype(str)
+    monthly_wins  = monthly[monthly['outcome'].isin(['TP1','TP2','TP3'])].groupby('month').size()
+    monthly_total = monthly.groupby('month').size()
+    monthly_wr    = (monthly_wins / monthly_total * 100).fillna(0).round(1)
+
+    month_labels = list(monthly_wr.index)
+    month_values = list(monthly_wr.values)
+
+    # Trade list (last 50)
+    recent = trades_df.sort_values('bar_time', ascending=False).head(50)
+    trade_rows = ''
+    for _, r in recent.iterrows():
+        outcome_color = {'TP1':'#4caf50','TP2':'#00e676','TP3':'#1de9b6',
+                         'SL':'#f44336','TIMEOUT':'#888'}.get(r['outcome'],'#888')
+        trade_rows += f"""<tr>
+          <td>{str(r['bar_time'])[:16]}</td>
+          <td>{r['symbol']}</td>
+          <td>{'🟢' if r['signal']=='LONG' else '🔴'} {r['signal']}</td>
+          <td>{r['score']}</td>
+          <td>{r['quality']}</td>
+          <td>{r['pd_zone']}</td>
+          <td>{r['trigger']}</td>
+          <td style="color:{outcome_color};font-weight:bold">{r['outcome']}</td>
+          <td style="color:{rr_color(r['pnl_rr'])}">{r['pnl_rr']:.2f}</td>
+          <td>{r['bars_to_exit']}h</td>
+        </tr>"""
+
+    # What-to-adjust table
+    suggestions = generate_suggestions(stats, trades_df)
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SMC Pro v4.0 — Backtest Report</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  * {{ box-sizing:border-box; margin:0; padding:0 }}
+  body {{ background:#0d1117; color:#e6edf3; font-family:'Segoe UI',sans-serif; padding:24px }}
+  h1 {{ color:#58a6ff; font-size:2rem; margin-bottom:4px }}
+  h2 {{ color:#58a6ff; font-size:1.3rem; margin:32px 0 12px }}
+  h3 {{ color:#8b949e; font-size:1rem; margin-bottom:12px }}
+  .subtitle {{ color:#8b949e; margin-bottom:32px }}
+  .grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:16px; margin-bottom:32px }}
+  .kpi {{ background:#161b22; border:1px solid #30363d; border-radius:10px; padding:20px; text-align:center }}
+  .kpi .val {{ font-size:2.2rem; font-weight:800; margin-bottom:4px }}
+  .kpi .lbl {{ color:#8b949e; font-size:.8rem }}
+  .card {{ background:#161b22; border:1px solid #30363d; border-radius:10px; padding:20px; margin-bottom:20px }}
+  .breakdowns {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:20px }}
+  table {{ width:100%; border-collapse:collapse; font-size:.85rem }}
+  th {{ background:#21262d; color:#58a6ff; padding:8px 12px; text-align:left }}
+  td {{ padding:7px 12px; border-bottom:1px solid #21262d }}
+  tr:hover td {{ background:#21262d }}
+  .chart-wrap {{ background:#161b22; border:1px solid #30363d; border-radius:10px; padding:20px; margin-bottom:20px }}
+  .suggest {{ background:#0d2137; border-left:4px solid #58a6ff; border-radius:6px; padding:14px 18px; margin-bottom:12px }}
+  .suggest .tag {{ color:#58a6ff; font-weight:bold; font-size:.8rem }}
+  .suggest .msg {{ margin-top:4px; color:#e6edf3 }}
+  .suggest .action {{ margin-top:6px; color:#3fb950; font-size:.85rem }}
+  .green {{ color:#3fb950 }} .red {{ color:#f85149 }} .yellow {{ color:#d29922 }}
+  .pill {{ display:inline-block; padding:2px 8px; border-radius:12px; font-size:.75rem }}
+  footer {{ color:#444; text-align:center; margin-top:40px; font-size:.8rem }}
+</style>
+</head>
+<body>
+<h1>🏦 SMC Pro v4.0 — Backtest Report</h1>
+<p class="subtitle">
+  📅 {date_from} → {date_to} &nbsp;|&nbsp;
+  🪙 {len(pairs_tested)} pairs &nbsp;|&nbsp;
+  ⏱ Walk-forward 1H step &nbsp;|&nbsp;
+  🎯 Min score {MIN_SCORE} &nbsp;|&nbsp;
+  ⏳ Max trade {MAX_TRADE_BARS}H
+</p>
+
+<!-- KPIs -->
+<div class="grid">
+  <div class="kpi">
+    <div class="val" style="color:{pct_color(stats['winrate'])}">{stats['winrate']}%</div>
+    <div class="lbl">Overall Win Rate</div>
+  </div>
+  <div class="kpi">
+    <div class="val" style="color:{rr_color(stats['avg_rr'])}">{stats['avg_rr']}</div>
+    <div class="lbl">Avg RR (all trades)</div>
+  </div>
+  <div class="kpi">
+    <div class="val" style="color:{rr_color(stats['expectancy'])}">{stats['expectancy']}</div>
+    <div class="lbl">Expectancy (RR/trade)</div>
+  </div>
+  <div class="kpi">
+    <div class="val">{stats['total']}</div>
+    <div class="lbl">Total Signals</div>
+  </div>
+  <div class="kpi">
+    <div class="val class=green">{stats['wins']}</div>
+    <div class="lbl">Winners (any TP)</div>
+  </div>
+  <div class="kpi">
+    <div class="val" style="color:#f85149">{stats['losses']}</div>
+    <div class="lbl">Stop Losses Hit</div>
+  </div>
+  <div class="kpi">
+    <div class="val">{stats['tp1_rate']}%</div>
+    <div class="lbl">TP1 Hit Rate</div>
+  </div>
+  <div class="kpi">
+    <div class="val">{stats['tp2_rate']}%</div>
+    <div class="lbl">TP2 Hit Rate</div>
+  </div>
+  <div class="kpi">
+    <div class="val">{stats['tp3_rate']}%</div>
+    <div class="lbl">TP3 Hit Rate</div>
+  </div>
+  <div class="kpi">
+    <div class="val">{stats['sl_rate']}%</div>
+    <div class="lbl">SL Hit Rate</div>
+  </div>
+  <div class="kpi">
+    <div class="val">{stats['avg_rr_wins']}</div>
+    <div class="lbl">Avg RR (wins only)</div>
+  </div>
+  <div class="kpi">
+    <div class="val">{stats['avg_bars']}h</div>
+    <div class="lbl">Avg Bars to Exit</div>
+  </div>
+</div>
+
+<!-- Charts -->
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px">
+  <div class="chart-wrap">
+    <h3>📊 Outcome Distribution</h3>
+    <canvas id="pieChart" height="220"></canvas>
+  </div>
+  <div class="chart-wrap">
+    <h3>📈 Monthly Win Rate %</h3>
+    <canvas id="monthChart" height="220"></canvas>
+  </div>
+</div>
+
+<!-- Suggestions -->
+<h2>🎯 What to Adjust — Actionable Findings</h2>
+{"".join(suggestions)}
+
+<!-- Breakdowns -->
+<h2>📋 Performance Breakdowns</h2>
+<div class="breakdowns">
+  {breakdown_table('By Signal Quality', stats.get('by_quality',{}))}
+  {breakdown_table('By Direction (Long/Short)', stats.get('by_signal',{}))}
+  {breakdown_table('By 1H Entry Trigger', stats.get('by_trigger',{}))}
+  {breakdown_table('By Score Bucket', stats.get('by_score',{}))}
+  {breakdown_table('By PD Zone', stats.get('by_pd_zone',{}))}
+  {breakdown_table('By Structure Type', stats.get('by_structure',{}))}
+  {breakdown_table('By HH/LL Confirmed', stats.get('by_hh_ll',{}))}
+  {breakdown_table('By Liquidity Sweep', stats.get('by_sweep',{}))}
+  {breakdown_table('By FVG Overlap', stats.get('by_fvg',{}))}
+  {breakdown_table('By OB Size', stats.get('by_ob_size',{}))}
+  {breakdown_table('By ADX Strength', stats.get('by_adx',{}))}
+  {breakdown_table('By Pair', stats.get('by_symbol',{}))}
+</div>
+
+<!-- Trade log -->
+<h2>📜 Recent Trade Log (last 50)</h2>
+<div class="card" style="overflow-x:auto">
+<table>
+  <tr>
+    <th>Time</th><th>Pair</th><th>Dir</th><th>Score</th><th>Quality</th>
+    <th>Zone</th><th>Trigger</th><th>Outcome</th><th>RR</th><th>Duration</th>
+  </tr>
+  {trade_rows}
+</table>
+</div>
+
+<footer>SMC Pro Backtester — Generated {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}</footer>
+
+<script>
+const pieCtx = document.getElementById('pieChart').getContext('2d');
+new Chart(pieCtx, {{
+  type: 'doughnut',
+  data: {{
+    labels: {list(outcomes.keys())},
+    datasets: [{{ data: {list(outcomes.values())},
+      backgroundColor: ['#4caf50','#00e676','#1de9b6','#f44336','#607d8b'],
+      borderColor:'#0d1117', borderWidth:2 }}]
+  }},
+  options: {{ plugins:{{ legend:{{ labels:{{ color:'#e6edf3' }} }} }} }}
+}});
+
+const mCtx = document.getElementById('monthChart').getContext('2d');
+new Chart(mCtx, {{
+  type: 'bar',
+  data: {{
+    labels: {json.dumps(month_labels)},
+    datasets: [{{
+      label: 'Win Rate %',
+      data: {json.dumps(month_values)},
+      backgroundColor: {json.dumps([('#3fb950' if v>=55 else '#d29922' if v>=45 else '#f85149') for v in month_values])},
+      borderRadius: 4
+    }}]
+  }},
+  options: {{
+    plugins:{{ legend:{{ labels:{{ color:'#e6edf3' }} }} }},
+    scales:{{
+      x:{{ ticks:{{ color:'#8b949e' }}, grid:{{ color:'#21262d' }} }},
+      y:{{ ticks:{{ color:'#8b949e' }}, grid:{{ color:'#21262d' }}, min:0, max:100 }}
+    }}
+  }}
+}});
+</script>
+</body>
+</html>"""
+    return html
+
+
+def generate_suggestions(stats: dict, df: pd.DataFrame) -> list:
+    """Produce data-driven actionable suggestions."""
+    suggs = []
+
+    def s(tag, icon, msg, action):
+        return f"""<div class="suggest">
+          <div class="tag">{icon} {tag}</div>
+          <div class="msg">{msg}</div>
+          <div class="action">→ {action}</div>
+        </div>"""
+
+    wr = stats['winrate']
+    if wr < 45:
+        suggs.append(s("LOW WIN RATE","🚨",
+            f"Overall winrate is {wr}% — below breakeven for 1:1.5 RR.",
+            "Raise MIN_SCORE to 80 or tighten OB_TOLERANCE_PCT to 0.005"))
+    elif wr >= 60:
+        suggs.append(s("STRONG WIN RATE","✅",
+            f"Winrate {wr}% — strategy is profitable.",
+            "Consider scaling: lower MIN_SCORE to 72 and test impact on signal count vs winrate"))
+
+    # Trigger quality
+    trig = stats.get('by_trigger', {})
+    best_t = max(trig.items(), key=lambda x: x[1]['winrate'], default=(None,{}))
+    worst_t= min(trig.items(), key=lambda x: x[1]['winrate'], default=(None,{}))
+    if best_t[0]:
+        suggs.append(s("BEST TRIGGER","🕯️",
+            f"{best_t[0]} wins at {best_t[1]['winrate']}% vs {worst_t[0]} at {worst_t[1]['winrate']}%.",
+            f"Penalise '{worst_t[0]}' harder (-15 instead of -12) in the no-trigger penalty if its winrate is <45%"))
+
+    # OB size
+    ob = stats.get('by_ob_size', {})
+    if '<0.5%' in ob and ob['<0.5%']['winrate'] > 60:
+        suggs.append(s("TIGHT OB EDGE","📦",
+            f"OBs <0.5% size win at {ob['<0.5%']['winrate']}%.",
+            "Lower OB_IMPULSE_ATR_MULT from 1.0 → 0.7 to find more tight OBs"))
+    if '>2%' in ob and ob['>2%']['winrate'] < 45:
+        suggs.append(s("WIDE OB DRAG","📦",
+            f"OBs >2% size only win {ob['>2%']['winrate']}% — dragging results.",
+            "Add hard gate: reject OBs where ob_size_pct > 1.5% (currently only loses 7pts)"))
+
+    # Direction bias
+    sig_b = stats.get('by_signal', {})
+    long_wr  = sig_b.get('LONG',  {}).get('winrate', 50)
+    short_wr = sig_b.get('SHORT', {}).get('winrate', 50)
+    diff = abs(long_wr - short_wr)
+    if diff > 10:
+        weaker = 'SHORT' if long_wr > short_wr else 'LONG'
+        suggs.append(s("DIRECTION BIAS","📊",
+            f"LONG wins {long_wr}% vs SHORT {short_wr}% — {diff:.0f}pt gap.",
+            f"Add +3pts score bonus for the stronger direction, or raise MIN_SCORE for {weaker} trades by 5pts"))
+
+    # HH/LL impact
+    hh_b = stats.get('by_hh_ll', {})
+    hh_true  = hh_b.get('True',  {}).get('winrate', 50)
+    hh_false = hh_b.get('False', {}).get('winrate', 50)
+    if hh_true - hh_false > 10:
+        suggs.append(s("HH/LL IS KEY","🏔️",
+            f"Trending (HH/LL) trades win {hh_true}% vs ranging {hh_false}%.",
+            f"Upgrade HH_LL_BONUS from {HH_LL_BONUS} → {HH_LL_BONUS+4} pts, or make it a soft gate (score -5 if absent)"))
+    elif hh_true - hh_false < 3:
+        suggs.append(s("HH/LL WEAK SIGNAL","〰️",
+            f"HH/LL adds only {hh_true-hh_false:.1f}pt win difference — low alpha.",
+            "Test removing HH_LL_BONUS entirely and reallocate those 8pts to trigger quality"))
+
+    # Sweep impact
+    sw_b = stats.get('by_sweep', {})
+    sw_t = sw_b.get('True', {}).get('winrate', 50)
+    sw_f = sw_b.get('False',{}).get('winrate', 50)
+    if sw_t - sw_f > 8:
+        suggs.append(s("SWEEP ADDS ALPHA","💧",
+            f"Trades with liq sweep win {sw_t}% vs {sw_f}% without.",
+            "Raise sweep bonus from 4pts → 7pts in score_setup extras"))
+    elif sw_t < sw_f:
+        suggs.append(s("SWEEP MISLEADS","💧",
+            f"Trades WITH sweep actually underperform ({sw_t}% vs {sw_f}%).",
+            "Investigate: sweep may be firing after strong momentum moves. Lower bonus to 2pts"))
+
+    # Score bucket sweet spot
+    sc_b = stats.get('by_score', {})
+    best_bucket = max(sc_b.items(), key=lambda x: x[1]['winrate'], default=(None,{}))
+    if best_bucket[0]:
+        suggs.append(s("SCORE SWEET SPOT","⭐",
+            f"Score bucket '{best_bucket[0]}' performs best at {best_bucket[1]['winrate']}% winrate "
+            f"({best_bucket[1]['count']} trades).",
+            f"Narrow signal quality gates: only send signals in the {best_bucket[0]} bucket as ELITE"))
+
+    # ADX
+    adx_b = stats.get('by_adx', {})
+    strong_adx = adx_b.get('30-40', adx_b.get('40-60', {}))
+    weak_adx   = adx_b.get('<20', {})
+    if strong_adx.get('winrate',50) - weak_adx.get('winrate',50) > 10:
+        suggs.append(s("ADX FILTER OPPORTUNITY","📐",
+            f"ADX 30-40 wins {strong_adx.get('winrate','?')}% vs ADX<20 at {weak_adx.get('winrate','?')}%.",
+            "Add optional ADX gate: skip signals when ADX < 20 (choppy market, no trend structure)"))
+
+    # Timeout rate
+    timeout_rate = stats['timeouts'] / stats['total'] * 100 if stats['total'] else 0
+    if timeout_rate > 25:
+        suggs.append(s("HIGH TIMEOUT RATE","⏰",
+            f"{timeout_rate:.0f}% of trades time out at {MAX_TRADE_BARS}H without hitting TP/SL.",
+            "Tighten TP1 to RR 1:1 (50% exit), or reduce MAX_TRADE_BARS to 32H. Some setups lack follow-through"))
+
+    # Pair performance
+    sym_b = stats.get('by_symbol', {})
+    top_pairs    = [k for k,v in sym_b.items() if v['winrate'] >= 65 and v['count'] >= 3]
+    bottom_pairs = [k for k,v in sym_b.items() if v['winrate'] < 40 and v['count'] >= 3]
+    if top_pairs:
+        suggs.append(s("BEST PAIRS","🏆",
+            f"Top performers: {', '.join(top_pairs[:6])}",
+            "Add a pair-priority list — scan these first, or weight their signals higher"))
+    if bottom_pairs:
+        suggs.append(s("UNDERPERFORMING PAIRS","🗑️",
+            f"Poor pairs: {', '.join(bottom_pairs[:6])} — consistently below 40%",
+            "Add a blocklist in get_pairs() for these symbols — they likely have low liquidity or unusual structure"))
+
+    return suggs
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  CONSOLE SUMMARY
+# ══════════════════════════════════════════════════════════════════════════
+
+def print_console_summary(stats: dict, pairs_done: list):
+    print("\n" + "═"*65)
+    print("  SMC PRO v4.0 — BACKTEST RESULTS")
+    print("═"*65)
+    print(f"  Pairs tested :  {len(pairs_done)}")
+    print(f"  Total trades :  {stats['total']}")
+    print(f"  Win rate     :  {stats['winrate']}%  "
+          f"({'✅ Profitable' if stats['winrate']>=55 else '⚠️ Below target' if stats['winrate']>=45 else '❌ Losing'})")
+    print(f"  TP1 / TP2 / TP3 : {stats['tp1_rate']}% / {stats['tp2_rate']}% / {stats['tp3_rate']}%")
+    print(f"  SL rate      :  {stats['sl_rate']}%")
+    print(f"  Avg RR       :  {stats['avg_rr']}  (wins: {stats['avg_rr_wins']})")
+    print(f"  Expectancy   :  {stats['expectancy']} RR/trade")
+    print(f"  Avg duration :  {stats['avg_bars']}h")
+    print("─"*65)
+    print("  BY QUALITY:")
+    for k, v in stats.get('by_quality',{}).items():
+        print(f"    {k:10s}  {v['count']:4d} trades  WR={v['winrate']}%  RR={v['avg_rr']}")
+    print("─"*65)
+    print("  BY DIRECTION:")
+    for k, v in stats.get('by_signal',{}).items():
+        print(f"    {k:8s}  {v['count']:4d} trades  WR={v['winrate']}%  RR={v['avg_rr']}")
+    print("─"*65)
+    print("  TOP 5 PAIRS:")
+    top5 = sorted(stats.get('by_symbol',{}).items(), key=lambda x: -x[1]['winrate'])[:5]
+    for k, v in top5:
+        print(f"    {k:12s}  {v['count']:3d} trades  WR={v['winrate']}%")
+    print("═"*65)
+    print(f"  📁 Full HTML report saved to ./bt_results/")
+    print("═"*65 + "\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════
+
+async def main():
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    since_ms = int(datetime.strptime(DATE_FROM, "%Y-%m-%d").timestamp() * 1000)
+    until_ms = int(datetime.strptime(DATE_TO,   "%Y-%m-%d").timestamp() * 1000)
+
+    exchange = getattr(ccxt, EXCHANGE_ID)({
+        'enableRateLimit': True,
+        'options': {'defaultType': EXCHANGE_TYPE}
+    })
+
+    pairs = PAIRS
+    if pairs is None:
+        print("⏳ Fetching top-volume pairs...")
+        await exchange.load_markets()
+        tickers = await exchange.fetch_tickers()
+        pairs = [
+            s for s in exchange.symbols
+            if s.endswith('/USDT:USDT') and 'PERP' not in s
+            and tickers.get(s, {}).get('quoteVolume', 0) > 5_000_000
+        ]
+        pairs.sort(key=lambda x: tickers.get(x,{}).get('quoteVolume',0), reverse=True)
+        pairs = pairs[:50]
+
+    all_trades    = []
+    pairs_done    = []
+    pairs_skipped = []
+
+    print(f"\n🔽  Downloading + backtesting {len(pairs)} pairs")
+    print(f"    Period: {DATE_FROM} → {DATE_TO}")
+    print(f"    Settings: MIN_SCORE={MIN_SCORE} | OB_TOL={OB_TOLERANCE_PCT} | WARMUP={MIN_WARMUP_BARS}bars\n")
+
+    for idx, symbol in enumerate(pairs):
+        short = symbol.replace('/USDT:USDT','')
+        print(f"  [{idx+1:2d}/{len(pairs)}] {short:12s}", end=" ", flush=True)
+
+        try:
+            df4  = await download_ohlcv(exchange, symbol, '4h',  since_ms, until_ms)
+            df1  = await download_ohlcv(exchange, symbol, '1h',  since_ms, until_ms)
+            df15 = await download_ohlcv(exchange, symbol, '15m', since_ms, until_ms)
+
+            if df1.empty or len(df1) < MIN_WARMUP_BARS + MAX_TRADE_BARS + 10:
+                print("⚠  not enough data — skip")
+                pairs_skipped.append(symbol)
                 continue
-            if len(raw_4h) < 150 or len(raw_daily) < 50:
-                continue
 
-            df_4h    = pd.DataFrame(raw_4h,    columns=['ts','open','high','low','close','volume'])
-            df_1h    = pd.DataFrame(raw_1h,    columns=['ts','open','high','low','close','volume'])
-            df_daily = pd.DataFrame(raw_daily, columns=['ts','open','high','low','close','volume'])
+            trades = walk_forward_pair(symbol, df4, df1, df15)
+            print(f"→ {len(trades):3d} signals", end="  ")
 
-            for df in [df_4h, df_1h, df_daily]:
-                df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+            wins = sum(1 for t in trades if t['outcome'] in ('TP1','TP2','TP3'))
+            wr   = wins/len(trades)*100 if trades else 0
+            print(f"WR={wr:.0f}%")
 
-            df_4h    = add_indicators(df_4h)
-            df_1h    = add_indicators(df_1h)
-            df_daily = add_indicators(df_daily)
-
-            # Walk forward on 4H candles within backtest window
-            cutoff_ts = df_4h['ts'].max() - pd.Timedelta(days=LOOKBACK_DAYS)
-            window    = df_4h[df_4h['ts'] >= cutoff_ts].copy()
-
-            pair_signals = 0
-            cooldown     = {}   # {direction: last_signal_ts}
-
-            for idx_w, (_, row_4h) in enumerate(window.iterrows()):
-                idx_full = df_4h.index.get_loc(row_4h.name)
-                if idx_full < 2:
-                    continue
-
-                r4h    = df_4h.iloc[idx_full]
-                p4h    = df_4h.iloc[idx_full - 1]
-
-                # Match daily candle (same date)
-                date_4h = r4h['ts'].date()
-                daily_match = df_daily[df_daily['ts'].dt.date <= date_4h]
-                if len(daily_match) < 2:
-                    continue
-                r_daily = daily_match.iloc[-1]
-
-                # Match 1H candle (closest before 4H candle)
-                h1_match = df_1h[df_1h['ts'] <= r4h['ts']]
-                if len(h1_match) < 1:
-                    continue
-                r1h = h1_match.iloc[-1]
-
-                # ADX gate
-                if r4h['adx'] < ADX_MIN or pd.isna(r4h['adx']):
-                    stats['adx_blocked'] += 1
-                    continue
-
-                ls, ss, lr, sr = score_candle(r4h, p4h, r1h, r_daily)
-
-                entry = r4h['close']
-                atr   = r4h['atr']
-                if pd.isna(atr) or atr <= 0:
-                    continue
-
-                for direction, score, reasons in [('LONG', ls, lr), ('SHORT', ss, sr)]:
-                    if score < thresh:
-                        continue
-
-                    # Regime check (daily + 4H aligned)
-                    if not check_regime(r_daily, r4h, direction):
-                        stats['regime_blocked'] += 1
-                        continue
-
-                    # LONG_BULL_ONLY: block LONGs when BTC daily is BEAR
-                    if LONG_BULL_ONLY and direction == 'LONG':
-                        date_match = btc_daily[btc_daily['ts'].dt.date <= date_4h]
-                        if len(date_match) > 0 and not date_match.iloc[-1]['btc_bull']:
-                            stats['regime_blocked'] += 1
-                            continue
-
-                    # ── v8 ELITE FILTERS ─────────────────────────────────────
-                    if direction == 'SHORT':
-
-                        # 1. Block extended SHORTs: price already >15% below 4H 200EMA
-                        if BLOCK_EXTENDED_SHORT and 'ema_200' in r4h.index and not pd.isna(r4h['ema_200']):
-                            ema200 = r4h['ema_200']
-                            if ema200 > 0 and (ema200 - r4h['close']) / ema200 > EXTENDED_SHORT_PCT:
-                                stats['regime_blocked'] += 1
-                                continue
-
-                        # 2. RSI gate: must be above RSI_SHORT_MIN (not already oversold)
-                        if REQUIRE_RSI_GATE:
-                            rsi_4h = r4h['rsi'] if 'rsi' in r4h.index and not pd.isna(r4h['rsi']) else 50
-                            if pd.isna(rsi_4h) or rsi_4h < RSI_SHORT_MIN:
-                                stats['regime_blocked'] += 1
-                                continue
-
-                        # 3. MACD signal required: must have cross OR expanding histogram
-                        if REQUIRE_MACD_SIGNAL:
-                            has_macd = (
-                                'macd_cross_4h_bear' in reasons or
-                                'macd_hist_expanding_bear' in reasons
-                            )
-                            if not has_macd:
-                                stats['regime_blocked'] += 1
-                                continue
-
-                        # 4. DI directional conviction: DI- must beat DI+ by margin
-                        if REQUIRE_DI_MARGIN:
-                            di_minus = r4h['di_minus'] if 'di_minus' in r4h.index and not pd.isna(r4h['di_minus']) else 0
-                            di_plus  = r4h['di_plus'] if 'di_plus' in r4h.index and not pd.isna(r4h['di_plus']) else 0
-                            if pd.isna(di_minus) or pd.isna(di_plus):
-                                stats['regime_blocked'] += 1
-                                continue
-                            if (di_minus - di_plus) < DI_MARGIN_MIN:
-                                stats['regime_blocked'] += 1
-                                continue
-
-                        # 5. Aroon confirmation: must be < -50 (confirmed downtrend)
-                        if REQUIRE_AROON_CONFIRM:
-                            aroon_val = r4h['aroon'] if 'aroon' in r4h.index and not pd.isna(r4h['aroon']) else 0
-                            if pd.isna(aroon_val) or aroon_val > -50:
-                                stats['regime_blocked'] += 1
-                                continue
-
-                    # Cooldown
-                    if direction in cooldown:
-                        elapsed = (r4h['ts'] - cooldown[direction]).total_seconds() / 3600
-                        if elapsed < COOLDOWN_HOURS:
-                            stats['cooldown_skip'] += 1
-                            continue
-
-                    score_pct = score / MAX_SCORE
-                    quality   = 'PREMIUM' if score >= premium_thresh else 'GOOD'
-
-                    if direction == 'LONG':
-                        tp1 = entry + ATR_TP1_MULT * atr
-                        sl  = entry - ATR_SL_MULT  * atr
-                    else:
-                        tp1 = entry - ATR_TP1_MULT * atr
-                        sl  = entry + ATR_SL_MULT  * atr
-
-                    # Skip if TP1 is unrealistically small (<3%) or huge (>25%)
-                    tp1_pct = abs(tp1 - entry) / entry * 100
-                    if tp1_pct < 3.0 or tp1_pct > 25.0:
-                        continue
-
-                    result = simulate_trade(idx_full, df_4h, direction, entry, sl, tp1)
-                    if result is None:
-                        continue
-
-                    tp1_pct  = abs(tp1 - entry) / entry * 100
-                    sl_pct   = abs(sl  - entry) / entry * 100
-                    trail_pct = TRAIL_ATR_MULT * atr / entry * 100
-
-                    all_signals.append({
-                        'symbol'    : symbol.replace('/USDT:USDT',''),
-                        'direction' : direction,
-                        'timestamp' : r4h['ts'],
-                        'entry'     : entry,
-                        'tp1'       : tp1,
-                        'sl'        : sl,
-                        'tp1_pct'   : round(tp1_pct, 2),
-                        'trail_pct' : round(trail_pct, 2),
-                        'sl_pct'    : round(sl_pct, 2),
-                        'atr'       : atr,
-                        'adx'       : r4h['adx'],
-                        'score_pct' : round(score_pct * 100, 1),
-                        'quality'   : quality,
-                        'outcome'   : result['outcome'],
-                        'pnl'       : round(result['pnl'], 3),
-                        'tp1_pnl'   : round(result['tp1_pnl'], 3),
-                        'trail_pnl' : round(result['tp2_pnl'], 3),
-                        'indicators': ', '.join(list(reasons.keys())[:6]),
-                    })
-
-                    cooldown[direction] = r4h['ts']
-                    pair_signals += 1
-
-            if pair_signals > 0:
-                logger.info(f"  📊 {symbol.replace('/USDT:USDT','')}... → {pair_signals} signals")
+            all_trades.extend(trades)
+            pairs_done.append(symbol)
 
         except Exception as e:
-            if 'ema_9' not in str(e):
-                logger.debug(f"[ERROR] {symbol}: {e}")
+            print(f"❌ {e}")
+            pairs_skipped.append(symbol)
             continue
-
-        if (i + 1) % 50 == 0:
-            logger.info(f"── {i+1}/{len(pairs)} pairs done | {len(all_signals)} signals so far ──")
 
     await exchange.close()
 
-    # ── RESULTS ────────────────────────────────────────────────────────────
-
-    if not all_signals:
-        print("❌ No signals found — try lowering MIN_SCORE_PCT")
+    if not all_trades:
+        print("\n❌ No trades generated. Check your DATE_FROM/DATE_TO and PAIRS config.")
         return
 
-    df = pd.DataFrame(all_signals)
-    df['date'] = pd.to_datetime(df['timestamp']).dt.date
-    df = df.sort_values('timestamp').reset_index(drop=True)
+    # ── Compute stats ──────────────────────────────────────────────────────
+    print(f"\n⚙️  Computing statistics over {len(all_trades)} trades...")
+    stats, trades_df = compute_stats(all_trades)
 
-    total      = len(df)
-    days       = LOOKBACK_DAYS
-    per_day    = round(total / days, 1)
+    # ── Save CSV ───────────────────────────────────────────────────────────
+    csv_path = RESULTS_DIR / "trades.csv"
+    trades_df.to_csv(csv_path, index=False)
+    print(f"✅  Trade CSV  → {csv_path}")
 
-    # ── REALISTIC EQUITY SIMULATION ──────────────────────────────────────────
-    # Simple sequential simulation: take every signal in time order
-    # 2% risk per trade, compounding. No concurrent cap (handled by cooldown in live)
-    # This gives the true edge picture — live throttling is a deployment decision
+    # ── Save HTML report ───────────────────────────────────────────────────
+    html = generate_html_report(stats, trades_df, DATE_FROM, DATE_TO, pairs_done)
+    html_path = RESULTS_DIR / "report.html"
+    html_path.write_text(html, encoding='utf-8')
+    print(f"✅  HTML report → {html_path}")
 
-    df_sorted = df.sort_values('timestamp').reset_index(drop=True)
+    # ── Save JSON stats ────────────────────────────────────────────────────
+    json_path = RESULTS_DIR / "stats.json"
+    # make JSON-serialisable
+    stats_out = {k: (v if not isinstance(v, dict) else
+                     {kk: {kkk: (bool(vvv) if isinstance(vvv,np.bool_) else
+                                 float(vvv) if isinstance(vvv, (np.floating, float)) else
+                                 int(vvv) if isinstance(vvv, (np.integer, int)) else str(vvv))
+                           for kkk, vvv in vv.items()}
+                      for kk, vv in v.items()})
+                 for k, v in stats.items()}
+    json_path.write_text(json.dumps(stats_out, indent=2, default=str))
+    print(f"✅  JSON stats  → {json_path}")
 
-    equity        = 1000.0
-    peak_equity   = equity
-    max_dd_equity = 0.0
-    equity_curve  = [equity]
+    # ── Console summary ────────────────────────────────────────────────────
+    print_console_summary(stats, pairs_done)
 
-    for _, row in df_sorted.iterrows():
-        sl_frac    = row['sl_pct'] / 100 if row['sl_pct'] > 0 else 0.05
-        risk_amt   = equity * RISK_PER_TRADE          # 2% of current equity
-        pos_value  = risk_amt / sl_frac               # position sized to risk exactly 2%
-        dollar_pnl = pos_value * (row['pnl'] / 100)
-
-        equity    += dollar_pnl
-        equity     = max(equity, 0.01)
-        equity_curve.append(equity)
-
-        if equity > peak_equity:
-            peak_equity = equity
-        dd = (equity - peak_equity) / peak_equity * 100
-        if dd < max_dd_equity:
-            max_dd_equity = dd
-
-    equity_return  = (equity_curve[-1] / equity_curve[0] - 1) * 100
-    trades_taken   = len(equity_curve) - 1
-    skipped = 0  # not applicable in sequential sim
-
-    # Outcome breakdown — v4 uses TRAIL instead of TP2
-    trail_mask   = df['outcome'] == 'TRAIL'
-    sl_mask      = df['outcome'] == 'SL'
-    be_mask      = df['outcome'] == 'BE'
-    tp1only_mask = df['outcome'].str.startswith('TIMEOUT_TP1')
-    timeout_mask = df['outcome'] == 'TIMEOUT'
-
-    n_trail  = trail_mask.sum()
-    n_sl     = sl_mask.sum()
-    n_be     = be_mask.sum()
-    n_tp1    = tp1only_mask.sum()
-    n_timeout= timeout_mask.sum()
-
-    # Kelly fraction: f = WR - (1-WR)/RR
-    avg_win_r  = (df[trail_mask]['pnl'].mean() / df[trail_mask]['sl_pct'].mean()) if n_trail > 0 else 0
-    wr_frac    = (n_trail + n_be) / (n_trail + n_sl + n_be) if (n_trail + n_sl + n_be) > 0 else 0
-    kelly_f    = wr_frac - (1 - wr_frac) / avg_win_r if avg_win_r > 0 else 0
-    kelly_2pct = kelly_f * 100
-
-    # WR = trail wins vs SL losses (decisive closes)
-    closed   = n_trail + n_sl
-    wr       = round(n_trail / closed * 100, 1) if closed > 0 else 0
-
-    # Including BE as partial win
-    full_outcomes = n_trail + n_sl + n_be
-    wr_incl_be = round((n_trail + n_be) / full_outcomes * 100, 1) if full_outcomes > 0 else 0
-
-    avg_pnl   = round(df['pnl'].mean(), 3)
-    avg_trail = round(df[trail_mask]['pnl'].mean(), 3) if n_trail > 0 else 0
-    avg_be    = round(df[be_mask]['pnl'].mean(), 3)    if n_be    > 0 else 0
-    avg_loss  = round(df[sl_mask]['pnl'].mean(), 3)    if n_sl    > 0 else 0
-
-    gross_profit = df[df['pnl'] > 0]['pnl'].sum()
-    gross_loss   = abs(df[df['pnl'] < 0]['pnl'].sum())
-    pf = round(gross_profit / gross_loss, 2) if gross_loss > 0 else 999
-
-    cumulative = df['pnl'].cumsum()
-    roll_max   = cumulative.cummax()
-    max_dd     = round((cumulative - roll_max).min(), 2)
-
-    avg_tp1_dist  = round(df['tp1_pct'].mean(), 2)
-    avg_trail_dist = round(df['trail_pct'].mean(), 2) if 'trail_pct' in df.columns else 0
-    avg_sl_dist   = round(df['sl_pct'].mean(), 2)
-
-    print("\n" + "╔"+"═"*54+"╗")
-    print("║" + "  📊 SWING BACKTEST v8 — REALISTIC SIM".center(54) + "║")
-    print("╚"+"═"*54+"╝")
-    print(f"\n  Settings: score≥{MIN_SCORE_PCT*100:.0f}% | HARD | ADX≥{ADX_MIN} | TP1={ATR_TP1_MULT}x | TRAIL={TRAIL_ATR_MULT}x | SL={ATR_SL_MULT}x")
-    print(f"  Risk: {RISK_PER_TRADE*100:.0f}%/trade | Max concurrent: {MAX_CONCURRENT}")
-    print(f"  Pairs: {df['symbol'].nunique()} | Lookback: {days}d\n")
-
-    print(f"  ── Raw Signal Stats (all signals) ──")
-    print(f"  Signals              : {total}  ({per_day}/day  |  {round(per_day*30)}/month)")
-    print(f"  Win Rate (Trail only): {wr}%")
-    print(f"  Win Rate (incl. BE)  : {wr_incl_be}%")
-    print(f"  Profit Factor        : {pf}")
-    print(f"  Avg PnL/trade        : {avg_pnl:+.3f}%")
-    print(f"  Avg Trail Win        : {avg_trail:+.3f}%")
-    print(f"  Avg BE (partial win) : {avg_be:+.3f}%")
-    print(f"  Avg SL Loss          : {avg_loss:+.3f}%")
-    print(f"  Max Drawdown (raw)   : {max_dd:.2f}%")
-    print(f"")
-    print(f"  ── 💰 Realistic Equity Simulation ({RISK_PER_TRADE*100:.0f}% risk/trade, max {MAX_CONCURRENT} concurrent) ──")
-    print(f"  Starting equity      : $1,000")
-    print(f"  Final equity         : ${equity_curve[-1]:,.2f}")
-    print(f"  Total return         : {equity_return:+.1f}%")
-    print(f"  Max Drawdown (equity): {max_dd_equity:.2f}%")
-    print(f"  Trades taken         : {trades_taken} / {total} (skipped {skipped} — concurrent cap)")
-    print(f"")
-    print(f"  ── Outcome Breakdown ──")
-    print(f"  🚀 TRAIL (full win)  : {n_trail}  ({round(n_trail/total*100,1)}%)")
-    print(f"  🔒 BE   (partial win): {n_be}   ({round(n_be/total*100,1)}%)")
-    print(f"  ⛔ SL   (full loss)  : {n_sl}   ({round(n_sl/total*100,1)}%)")
-    print(f"  ⏰ Timeout (TP1)     : {n_tp1}  ({round(n_tp1/total*100,1)}%)")
-    print(f"  ⏰ Timeout (no hit)  : {n_timeout} ({round(n_timeout/total*100,1)}%)")
-    print(f"")
-    print(f"  ── Avg Level Distances ──")
-    print(f"  TP1: +{avg_tp1_dist}%  |  Trail dist: {avg_trail_dist}%  |  SL: -{avg_sl_dist}%")
-    print(f"  Regime blocked: {stats['regime_blocked']} | ADX blocked: {stats['adx_blocked']} | Cooldown skip: {stats['cooldown_skip']}")
-
-    print(f"\n  ── By Direction ──")
-    for d in ['LONG','SHORT']:
-        sub = df[df['direction']==d]
-        if len(sub) == 0: continue
-        sub_closed = sub[sub['outcome'].isin(['TRAIL','SL'])]
-        d_wr = round(sub[sub['outcome']=='TRAIL'].shape[0] / len(sub_closed) * 100, 1) if len(sub_closed) > 0 else 0
-        print(f"  {d:5s} | n={len(sub):4d} ({round(len(sub)/days,1)}/day) | WR={d_wr}% | Avg={sub['pnl'].mean():+.3f}%")
-
-    print(f"\n  ── By Quality ──")
-    for q in ['PREMIUM','GOOD']:
-        sub = df[df['quality']==q]
-        if len(sub) == 0: continue
-        sub_closed = sub[sub['outcome'].isin(['TRAIL','SL'])]
-        q_wr = round(sub[sub['outcome']=='TRAIL'].shape[0] / len(sub_closed) * 100, 1) if len(sub_closed) > 0 else 0
-        print(f"  {q:8s} | n={len(sub):4d} | WR={q_wr}% | Avg={sub['pnl'].mean():+.3f}%")
-
-    print(f"\n  ── Score Band Breakdown ──")
-    print(f"  {'Band':<12} {'n':>6} {'WR%':>8} {'Avg%':>9} {'SL%':>8}")
-    for lo_b, hi_b in [(55,60),(60,65),(65,70),(70,75),(75,100)]:
-        band = df[(df['score_pct'] >= lo_b) & (df['score_pct'] < hi_b)]
-        if len(band) < 3: continue
-        band_closed = band[band['outcome'].isin(['TRAIL','SL'])]
-        b_wr  = round(band[band['outcome']=='TRAIL'].shape[0] / len(band_closed) * 100, 1) if len(band_closed) > 0 else 0
-        b_sl  = round(band[band['outcome']=='SL'].shape[0] / len(band_closed) * 100, 1) if len(band_closed) > 0 else 0
-        print(f"  {lo_b}-{hi_b}%     {len(band):>6}   {b_wr:>6.1f}%  {band['pnl'].mean():>+8.3f}%   {b_sl:>5.1f}%")
-
-    print(f"\n  ── By ADX Strength ──")
-    for lo_a, hi_a in [(25,30),(30,35),(35,40),(40,100)]:
-        band = df[(df['adx'] >= lo_a) & (df['adx'] < hi_a)]
-        if len(band) < 3: continue
-        band_closed = band[band['outcome'].isin(['TRAIL','SL'])]
-        b_wr = round(band[band['outcome']=='TRAIL'].shape[0] / len(band_closed) * 100, 1) if len(band_closed) > 0 else 0
-        print(f"  ADX {lo_a}-{hi_a}: n={len(band):4d} | WR={b_wr}% | Avg={band['pnl'].mean():+.3f}%")
-
-    # Indicator WR
-    print(f"\n  ── Indicator Win Rates ──")
-    ind_stats = {}
-    for _, row in df.iterrows():
-        if pd.isna(row['indicators']): continue
-        for ind in str(row['indicators']).split(', '):
-            ind = ind.strip()
-            if not ind: continue
-            if ind not in ind_stats:
-                ind_stats[ind] = {'wins': 0, 'total': 0}
-            ind_stats[ind]['total'] += 1
-            if row['outcome'] == 'TRAIL':
-                ind_stats[ind]['wins'] += 1
-    ind_df = pd.DataFrame([
-        {'indicator': k, 'wr': round(v['wins']/v['total']*100,1), 'n': v['total']}
-        for k, v in ind_stats.items() if v['total'] >= 5
-    ]).sort_values('wr', ascending=False)
-    print(f"  {'Indicator':<35} {'WR':>6}  {'n':>6}")
-    for _, row in ind_df.head(15).iterrows():
-        bar = '█' * int(row['wr'] / 6)
-        print(f"  {row['indicator']:<35} {row['wr']:>5.1f}%  {int(row['n']):>5}  {bar}")
-    if len(ind_df) > 15:
-        print(f"\n  BOTTOM (consider tuning):")
-        for _, row in ind_df.tail(6).iterrows():
-            print(f"  {row['indicator']:<35} {row['wr']:>5.1f}%  n={int(row['n'])}")
-
-    # Top symbols
-    print(f"\n  ── Top 15 Symbols ──")
-    sym_stats = df.groupby('symbol').apply(lambda x: pd.Series({
-        'signals'    : len(x),
-        'trail_wins' : (x['outcome']=='TRAIL').sum(),
-        'sl_hits'    : (x['outcome']=='SL').sum(),
-        'avg_pnl'    : round(x['pnl'].mean(), 3),
-    })).reset_index()
-    sym_stats['closed'] = sym_stats['trail_wins'] + sym_stats['sl_hits']
-    sym_stats['wr'] = (sym_stats['trail_wins'] / sym_stats['closed'] * 100).round(1)
-    sym_stats = sym_stats[sym_stats['closed'] >= 3].sort_values('wr', ascending=False)
-    print(f"  {'Symbol':<18} {'n':>5} {'WR%':>7} {'Avg%':>8}")
-    for _, row in sym_stats.head(15).iterrows():
-        print(f"  {row['symbol']:<18} {int(row['signals']):>5} {row['wr']:>6.1f}% {row['avg_pnl']:>+8.3f}%")
-
-    # ── Save Excel ──────────────────────────────────────────────────────
-    print(f"\n  💾 Saving to {OUTPUT_FILE}...")
-    with pd.ExcelWriter(OUTPUT_FILE, engine='xlsxwriter') as writer:
-        df.to_excel(writer, sheet_name='All Signals', index=False)
-
-        summary = pd.DataFrame([
-            ['SWING BACKTEST v4.0 — TRAILING STOP', ''],
-            ['Lookback (days)', days],
-            ['Pairs', df['symbol'].nunique()],
-            ['Total Signals', total],
-            ['Signals/day', per_day],
-            ['', ''],
-            ['Win Rate (Trail only)', f"{wr}%"],
-            ['Win Rate (incl. BE)', f"{wr_incl_be}%"],
-            ['Profit Factor', pf],
-            ['Avg PnL/trade', f"{avg_pnl:+.3f}%"],
-            ['Avg Trail Win', f"{avg_trail:+.3f}%"],
-            ['Avg BE', f"{avg_be:+.3f}%"],
-            ['Avg SL Loss', f"{avg_loss:+.3f}%"],
-            ['Max Drawdown', f"{max_dd:.2f}%"],
-            ['', ''],
-            ['TRAIL count', n_trail],
-            ['BE count', n_be],
-            ['SL count', n_sl],
-            ['Timeout (TP1)', n_tp1],
-            ['Timeout (no hit)', n_timeout],
-            ['', ''],
-            ['Avg TP1 distance', f"+{avg_tp1_dist}%"],
-            ['Avg Trail distance', f"{avg_trail_dist}%"],
-            ['Avg SL distance', f"-{avg_sl_dist}%"],
-            ['', ''],
-            ['Regime blocked', stats['regime_blocked']],
-            ['ADX blocked', stats['adx_blocked']],
-            ['Cooldown skips', stats['cooldown_skip']],
-        ], columns=['Metric', 'Value'])
-        summary.to_excel(writer, sheet_name='Summary', index=False)
-        sym_stats.to_excel(writer, sheet_name='By Symbol', index=False)
-        ind_df.to_excel(writer, sheet_name='Indicators', index=False)
-
-    print(f"  ✅ Saved!\n")
-
-    print("╔"+"═"*54+"╗")
-    print("║" + "  ✅ SWING BOT v7 — DEPLOY CHECKLIST".center(54) + "║")
-    print("╚"+"═"*54+"╝")
-    print(f"  TRADE_MODE           = 'TP1_TRAIL'")
-    print(f"  REGIME_MODE          = 'HARD'")
-    print(f"  MIN_SCORE_PCT        = {MIN_SCORE_PCT}")
-    print(f"  ATR_TP1_MULT         = {ATR_TP1_MULT}  (target +{avg_tp1_dist}%)")
-    print(f"  TRAIL_ATR_MULT       = {TRAIL_ATR_MULT}  (trail dist {avg_trail_dist}%)")
-    print(f"  ATR_SL_MULT          = {ATR_SL_MULT}   (risk   -{avg_sl_dist}%)")
-    print(f"  ADX_MIN              = {ADX_MIN}  ← elite trend filter")
-    print(f"  REQUIRE_BELOW_200EMA = True  ← SHORT quality gate")
-    print(f"  LONG_BULL_ONLY       = {LONG_BULL_ONLY}")
-    print(f"  MAX_CONCURRENT       = {MAX_CONCURRENT}  (live: max open trades)")
-    print(f"  RISK_PER_TRADE       = {RISK_PER_TRADE*100:.0f}%  (equity risk per trade)")
-    print(f"  COOLDOWN_HRS         = {COOLDOWN_HOURS}")
-    print(f"")
-    print(f"  Expected: {per_day}/day | {wr}% Trail WR | {equity_return:+.1f}% return/90d")
-    print(f"  Realistic DD: {max_dd_equity:.1f}% | Monitor /stats after 2 weeks live\n")
-
-    print("╔"+"═"*54+"╗")
-    print("║" + "  📊 v6 vs v7 COMPARISON".center(54) + "║")
-    print("╚"+"═"*54+"╝")
-    print(f"  {'Metric':<25} {'v6':>10} {'v7':>10}")
-    print(f"  {'─'*45}")
-    print(f"  {'Min score':<25} {'68%':>10} {MIN_SCORE_PCT*100:.0f}%")
-    print(f"  {'Trail mult':<25} {'2.0x':>10} {TRAIL_ATR_MULT}x")
-    print(f"  {'TP1 position':<25} {'50%':>10} {int(TP1_POSITION_PCT*100)}%")
-    print(f"  {'Equity sim':<25} {'No':>10} {'Yes':>10}")
-    print(f"  {'Max concurrent':<25} {'∞':>10} {MAX_CONCURRENT}")
-    print(f"  {'─'*45}")
-    print(f"  {'Signals/day':<25} {'1.2':>10} {per_day}")
-    print(f"  {'Trail WR':<25} {'50.5%':>10} {wr}%")
-    print(f"  {'Avg PnL/trade':<25} {'+2.4%':>10} {avg_pnl:+.1f}%")
-    print(f"  {'Equity return/90d':<25} {'N/A':>10} {equity_return:+.1f}%")
-    print(f"  {'Max DD (equity)':<25} {'N/A':>10} {max_dd_equity:.1f}%")
-    print(f"  {'SL rate':<25} {'49.1%':>10} {round(n_sl/total*100,1)}%\n")
+    if pairs_skipped:
+        print(f"⚠  Skipped {len(pairs_skipped)} pairs: {', '.join(p.replace('/USDT:USDT','') for p in pairs_skipped)}")
 
 
-if __name__ == '__main__':
-    asyncio.run(run_backtest())
+if __name__ == "__main__":
+    asyncio.run(main())
