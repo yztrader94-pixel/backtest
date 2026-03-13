@@ -1,29 +1,26 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     SWING BOT BACKTEST v7.0 — REALISTIC EQUITY SIMULATION   ║
+║     SWING BOT BACKTEST v8.0 — TARGET 80-85% WIN RATE       ║
 ║                                                              ║
-║  Strategy: Trailing stop — same as v5/v6                    ║
+║  Strategy: Stacked elite filters — fewer, cleaner signals   ║
 ║                                                              ║
-║  Changes from v6:                                           ║
-║    - MIN_SCORE_PCT: 0.68 → 0.63  (restore signal volume)   ║
-║    - TRAIL_ATR_MULT: 2.0 → 2.5   (restore v5 winner)       ║
-║    - TP1_POSITION_PCT: 0.5 → 0.4  (restore v5)             ║
-║    - QUALITY_PREMIUM: 0.80 → 0.75                           ║
-║    - MAX_CONCURRENT: 3  (cap open trades at once)           ║
-║    - RISK_PER_TRADE: 0.02  (2% equity risk per trade)       ║
-║    - Real drawdown now uses risk-weighted PnL               ║
+║  Changes from v7:                                           ║
+║    - MIN_SCORE_PCT: 0.63 → 0.75   (v7 showed 75%WR here)  ║
+║    - ADX_MIN: 40 → 50             (ultra-strong trend only) ║
+║    - ATR_SL_MULT: 1.2 → 1.5      (wider SL, less noise)   ║
+║    - REQUIRE_RSI_SHORT: rsi>58    (momentum confirmation)   ║
+║    - REQUIRE_DI_MARGIN: DI->DI+   (directional conviction) ║
+║    - BLOCK_EXTENDED_SHORT: True   (no 4h_below_200ema)     ║
+║    - REQUIRE_MACD_BEAR: True      (must have MACD signal)  ║
+║    - COOLDOWN_HOURS: 24 → 48      (no chasing)             ║
 ║                                                              ║
-║  Key insight: v6 over-filtered to 106 signals (coin flip)  ║
-║    v5's 525 signals with ADX≥40 + below200 = true edge     ║
-║    Problem was sequential losses hitting same direction     ║
-║    Fix: cap concurrent trades + realistic equity sizing     ║
-║                                                              ║
-║  Output: backtest_swing_v7_results.xlsx                     ║
+║  Goal: 80-85% WR with ~10-30 signals/month                 ║
+║  Output: backtest_swing_v8_results.xlsx                     ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Run:
     pip install ccxt ta pandas numpy xlsxwriter
-    python backtest_swing_v7.py
+    python backtest_swing_v8.py
 """
 
 import asyncio
@@ -41,29 +38,40 @@ logger = logging.getLogger('SwingBacktest')
 
 # ── SETTINGS (must match swing_bot_v1.py exactly) ──────────────────────────
 
-LOOKBACK_DAYS     = 360
+LOOKBACK_DAYS     = 720
 TOP_N_PAIRS       = 600
 MIN_VOLUME_USDT   = 500_000
 
 ATR_TP1_MULT      = 2.0   # unchanged
-ATR_SL_MULT       = 1.2   # unchanged
-TRAIL_ATR_MULT    = 2.5   # restored from v5 (was 2.0 in v6)
-TP1_POSITION_PCT  = 0.4   # restored from v5 (was 0.5 in v6)
+ATR_SL_MULT       = 1.5   # WIDENED from 1.2 — reduce noise SLs
+TRAIL_ATR_MULT    = 2.5   # unchanged
+TP1_POSITION_PCT  = 0.4   # unchanged
 
-MIN_SCORE_PCT     = 0.63  # rolled back from 0.68 — restore signal volume
-QUALITY_PREMIUM   = 0.75
-ADX_MIN           = 40    # keep — this is real alpha
+MIN_SCORE_PCT     = 0.75  # RAISED from 0.63 — v7 showed 75%+ band = 75% WR
+QUALITY_PREMIUM   = 0.85  # RAISED — ultra-elite signals only
+ADX_MIN           = 50    # RAISED from 40 — ultra-strong trend only
 LONG_BULL_ONLY    = True
-REQUIRE_BELOW_200EMA_SHORT = False  # REMOVED — 4h_below_200ema = 43.3% WR, was hurting
+REQUIRE_BELOW_200EMA_SHORT = False  # keep off — 4h_below_200ema = 46% WR killer
+
+# ── v8 NEW FILTERS ──
+REQUIRE_RSI_GATE       = True   # SHORT: 4H RSI must be > 58 (not already oversold)
+RSI_SHORT_MIN          = 58     # momentum still bearish, not oversold bounce
+REQUIRE_MACD_SIGNAL    = True   # must have macd_cross OR macd_hist_expanding (not just score pts)
+BLOCK_EXTENDED_SHORT   = True   # block if 4H price > 15% below 200 EMA (chasing extended)
+EXTENDED_SHORT_PCT     = 0.15   # 15% below 200EMA = already extended, skip
+REQUIRE_DI_MARGIN      = True   # DI- must exceed DI+ by at least 5pts for SHORTs
+DI_MARGIN_MIN          = 5      # directional conviction threshold
+REQUIRE_AROON_CONFIRM  = True   # Aroon must be < -50 for SHORTs (confirmed downtrend)
+
 MAX_TRADE_DAYS    = 10    # unchanged
-COOLDOWN_HOURS    = 24
+COOLDOWN_HOURS    = 48    # RAISED from 24 — no chasing back-to-back on same pair
 MAX_SCORE         = 40.0
 
 # ── REALISTIC SIMULATION ──
-MAX_CONCURRENT    = 10    # realistic: 550 pairs, different assets = low correlation
-RISK_PER_TRADE    = 0.02  # 2% equity per trade = max 20% capital at risk concurrent
+MAX_CONCURRENT    = 10
+RISK_PER_TRADE    = 0.02
 
-OUTPUT_FILE = '/mnt/user-data/outputs/backtest_swing_v7_results.xlsx'
+OUTPUT_FILE = '/mnt/user-data/outputs/backtest_swing_v8_results.xlsx'
 
 # ── INDICATORS ─────────────────────────────────────────────────────────────
 
@@ -365,7 +373,7 @@ async def run_backtest():
 
     print(f"""
 ╔══════════════════════════════════════════════════════╗
-║           SWING BOT BACKTEST v3.0                   ║
+║           SWING BOT BACKTEST v8.0                   ║
 ║  {LOOKBACK_DAYS}d | {TOP_N_PAIRS} pairs | score≥{MIN_SCORE_PCT*100:.0f}% | ADX≥{ADX_MIN} | HARD
 ║  TP1={ATR_TP1_MULT}x ATR (40%) | TRAIL={TRAIL_ATR_MULT}x ATR | SL={ATR_SL_MULT}x ATR
 ║  LONG_BULL_ONLY={LONG_BULL_ONLY} | tighter SL | ADX≥30
@@ -488,11 +496,50 @@ async def run_backtest():
                             stats['regime_blocked'] += 1
                             continue
 
-                    # SHORT quality gate: require price below 4H 200 EMA (55.8% WR in v5)
-                    if REQUIRE_BELOW_200EMA_SHORT and direction == 'SHORT':
-                        if r4h['close'] >= r4h['ema_200']:
-                            stats['regime_blocked'] += 1
-                            continue
+                    # ── v8 ELITE FILTERS ─────────────────────────────────────
+                    if direction == 'SHORT':
+
+                        # 1. Block extended SHORTs: price already >15% below 4H 200EMA
+                        if BLOCK_EXTENDED_SHORT and 'ema_200' in r4h.index and not pd.isna(r4h['ema_200']):
+                            ema200 = r4h['ema_200']
+                            if ema200 > 0 and (ema200 - r4h['close']) / ema200 > EXTENDED_SHORT_PCT:
+                                stats['regime_blocked'] += 1
+                                continue
+
+                        # 2. RSI gate: must be above RSI_SHORT_MIN (not already oversold)
+                        if REQUIRE_RSI_GATE:
+                            rsi_4h = r4h['rsi'] if 'rsi' in r4h.index and not pd.isna(r4h['rsi']) else 50
+                            if pd.isna(rsi_4h) or rsi_4h < RSI_SHORT_MIN:
+                                stats['regime_blocked'] += 1
+                                continue
+
+                        # 3. MACD signal required: must have cross OR expanding histogram
+                        if REQUIRE_MACD_SIGNAL:
+                            has_macd = (
+                                'macd_cross_4h_bear' in reasons or
+                                'macd_hist_expanding_bear' in reasons
+                            )
+                            if not has_macd:
+                                stats['regime_blocked'] += 1
+                                continue
+
+                        # 4. DI directional conviction: DI- must beat DI+ by margin
+                        if REQUIRE_DI_MARGIN:
+                            di_minus = r4h['di_minus'] if 'di_minus' in r4h.index and not pd.isna(r4h['di_minus']) else 0
+                            di_plus  = r4h['di_plus'] if 'di_plus' in r4h.index and not pd.isna(r4h['di_plus']) else 0
+                            if pd.isna(di_minus) or pd.isna(di_plus):
+                                stats['regime_blocked'] += 1
+                                continue
+                            if (di_minus - di_plus) < DI_MARGIN_MIN:
+                                stats['regime_blocked'] += 1
+                                continue
+
+                        # 5. Aroon confirmation: must be < -50 (confirmed downtrend)
+                        if REQUIRE_AROON_CONFIRM:
+                            aroon_val = r4h['aroon'] if 'aroon' in r4h.index and not pd.isna(r4h['aroon']) else 0
+                            if pd.isna(aroon_val) or aroon_val > -50:
+                                stats['regime_blocked'] += 1
+                                continue
 
                     # Cooldown
                     if direction in cooldown:
@@ -652,7 +699,7 @@ async def run_backtest():
     avg_sl_dist   = round(df['sl_pct'].mean(), 2)
 
     print("\n" + "╔"+"═"*54+"╗")
-    print("║" + "  📊 SWING BACKTEST v7 — REALISTIC SIM".center(54) + "║")
+    print("║" + "  📊 SWING BACKTEST v8 — REALISTIC SIM".center(54) + "║")
     print("╚"+"═"*54+"╝")
     print(f"\n  Settings: score≥{MIN_SCORE_PCT*100:.0f}% | HARD | ADX≥{ADX_MIN} | TP1={ATR_TP1_MULT}x | TRAIL={TRAIL_ATR_MULT}x | SL={ATR_SL_MULT}x")
     print(f"  Risk: {RISK_PER_TRADE*100:.0f}%/trade | Max concurrent: {MAX_CONCURRENT}")
