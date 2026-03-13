@@ -47,7 +47,7 @@ ATR_SL_MULT       = 1.5   # WIDENED from 1.2 — reduce noise SLs
 TRAIL_ATR_MULT    = 2.5   # unchanged
 TP1_POSITION_PCT  = 0.4   # unchanged
 
-MIN_SCORE_PCT     = 0.75  # RAISED from 0.63 — v7 showed 75%+ band = 75% WR
+MIN_SCORE_PCT     = 0.69  # RAISED from 0.63 — v7 showed 75%+ band = 75% WR
 QUALITY_PREMIUM   = 0.85  # RAISED — ultra-elite signals only
 ADX_MIN           = 50    # RAISED from 40 — ultra-strong trend only
 LONG_BULL_ONLY    = True
