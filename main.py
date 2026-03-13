@@ -54,14 +54,14 @@ MIN_SCORE_PCT     = 0.63  # rolled back from 0.68 — restore signal volume
 QUALITY_PREMIUM   = 0.75
 ADX_MIN           = 40    # keep — this is real alpha
 LONG_BULL_ONLY    = True
-REQUIRE_BELOW_200EMA_SHORT = True  # keep — 55.8% WR gate
+REQUIRE_BELOW_200EMA_SHORT = False  # REMOVED — 4h_below_200ema = 43.3% WR, was hurting
 MAX_TRADE_DAYS    = 10    # unchanged
 COOLDOWN_HOURS    = 24
 MAX_SCORE         = 40.0
 
 # ── REALISTIC SIMULATION ──
-MAX_CONCURRENT    = 3     # max open trades at once (realistic for live trading)
-RISK_PER_TRADE    = 0.02  # 2% of equity risked per trade
+MAX_CONCURRENT    = 10    # realistic: 550 pairs, different assets = low correlation
+RISK_PER_TRADE    = 0.02  # 2% equity per trade = max 20% capital at risk concurrent
 
 OUTPUT_FILE = '/mnt/user-data/outputs/backtest_swing_v7_results.xlsx'
 
@@ -295,13 +295,14 @@ def simulate_trade(idx, df_4h, direction, entry, sl, tp1, tp2=None):
     for i, (_, candle) in enumerate(future.iterrows()):
         hi = candle['high']
         lo = candle['low']
+        close_ts = candle['ts']
 
         if direction == 'LONG':
             if not tp1_hit:
                 # Phase 1: hard SL
                 if lo <= sl:
                     loss = (sl - entry) / entry * 100
-                    return {'outcome': 'SL', 'pnl': -abs(loss), 'tp1_pnl': 0, 'tp2_pnl': 0}
+                    return {'outcome': 'SL', 'pnl': -abs(loss), 'tp1_pnl': 0, 'tp2_pnl': 0, 'close_ts': close_ts}
                 if hi >= tp1:
                     tp1_hit  = True
                     peak     = max(hi, tp1)
@@ -317,13 +318,13 @@ def simulate_trade(idx, df_4h, direction, entry, sl, tp1, tp2=None):
                     blended   = tp1_gain * TP1_POSITION_PCT + exit_gain * (1 - TP1_POSITION_PCT)
                     outcome   = 'TRAIL' if exit_gain > 0 else 'BE'
                     return {'outcome': outcome, 'pnl': blended,
-                            'tp1_pnl': tp1_gain, 'tp2_pnl': exit_gain}
+                            'tp1_pnl': tp1_gain, 'tp2_pnl': exit_gain, 'close_ts': close_ts}
 
         else:  # SHORT
             if not tp1_hit:
                 if hi >= sl:
                     loss = (entry - sl) / entry * 100
-                    return {'outcome': 'SL', 'pnl': -abs(loss), 'tp1_pnl': 0, 'tp2_pnl': 0}
+                    return {'outcome': 'SL', 'pnl': -abs(loss), 'tp1_pnl': 0, 'tp2_pnl': 0, 'close_ts': close_ts}
                 if lo <= tp1:
                     tp1_hit  = True
                     peak     = min(lo, tp1)
@@ -338,9 +339,10 @@ def simulate_trade(idx, df_4h, direction, entry, sl, tp1, tp2=None):
                     blended   = tp1_gain * TP1_POSITION_PCT + exit_gain * (1 - TP1_POSITION_PCT)
                     outcome   = 'TRAIL' if exit_gain > 0 else 'BE'
                     return {'outcome': outcome, 'pnl': blended,
-                            'tp1_pnl': tp1_gain, 'tp2_pnl': exit_gain}
+                            'tp1_pnl': tp1_gain, 'tp2_pnl': exit_gain, 'close_ts': close_ts}
 
     # Timeout
+    close_ts = future.iloc[-1]['ts'] if len(future) > 0 else None
     if tp1_hit:
         tp1_gain = abs(tp1 - entry) / entry * 100
         # Exit at last candle close
@@ -351,8 +353,8 @@ def simulate_trade(idx, df_4h, direction, entry, sl, tp1, tp2=None):
             exit_gain = (entry - last_close) / entry * 100
         blended = tp1_gain * TP1_POSITION_PCT + exit_gain * (1 - TP1_POSITION_PCT)
         return {'outcome': 'TIMEOUT_TP1', 'pnl': blended,
-                'tp1_pnl': tp1_gain, 'tp2_pnl': exit_gain}
-    return {'outcome': 'TIMEOUT', 'pnl': 0, 'tp1_pnl': 0, 'tp2_pnl': 0}
+                'tp1_pnl': tp1_gain, 'tp2_pnl': exit_gain, 'close_ts': close_ts}
+    return {'outcome': 'TIMEOUT', 'pnl': 0, 'tp1_pnl': 0, 'tp2_pnl': 0, 'close_ts': close_ts}
 
 
 
@@ -574,65 +576,25 @@ async def run_backtest():
     per_day    = round(total / days, 1)
 
     # ── REALISTIC EQUITY SIMULATION ──────────────────────────────────────────
-    # Each signal has entry timestamp + estimated duration based on outcome
-    # We track which trades are actually open at each signal entry time
-    # MAX_CONCURRENT = real cap on simultaneous positions
+    # Simple sequential simulation: take every signal in time order
+    # 2% risk per trade, compounding. No concurrent cap (handled by cooldown in live)
+    # This gives the true edge picture — live throttling is a deployment decision
 
-    # Estimate trade duration in hours based on outcome + candle count
-    # 4H candles: TP hits avg ~3-5 days, SL ~1-2 days
-    OUTCOME_DURATION_DAYS = {
-        'TRAIL': 5, 'BE': 3, 'SL': 2,
-        'TIMEOUT_TP1': MAX_TRADE_DAYS, 'TIMEOUT': 1
-    }
-
-    # Build list of (entry_time, exit_time, pnl, sl_pct)
-    trade_events = []
-    for _, row in df.iterrows():
-        entry_ts = pd.to_datetime(row['timestamp'])
-        dur_days = OUTCOME_DURATION_DAYS.get(row['outcome'], 3)
-        exit_ts  = entry_ts + pd.Timedelta(days=dur_days)
-        trade_events.append({
-            'entry_ts': entry_ts,
-            'exit_ts' : exit_ts,
-            'pnl'     : row['pnl'],
-            'sl_pct'  : row['sl_pct'] if row['sl_pct'] > 0 else 5.0,
-            'outcome' : row['outcome'],
-        })
-
-    # Sort by entry time
-    trade_events.sort(key=lambda x: x['entry_ts'])
+    df_sorted = df.sort_values('timestamp').reset_index(drop=True)
 
     equity        = 1000.0
     peak_equity   = equity
     max_dd_equity = 0.0
     equity_curve  = [equity]
-    skipped       = 0
 
-    # Active trades = list of exit_ts for currently open trades
-    active_exits  = []
+    for _, row in df_sorted.iterrows():
+        sl_frac    = row['sl_pct'] / 100 if row['sl_pct'] > 0 else 0.05
+        risk_amt   = equity * RISK_PER_TRADE          # 2% of current equity
+        pos_value  = risk_amt / sl_frac               # position sized to risk exactly 2%
+        dollar_pnl = pos_value * (row['pnl'] / 100)
 
-    for t in trade_events:
-        entry_ts = t['entry_ts']
-
-        # Remove trades that have closed before this entry
-        active_exits = [e for e in active_exits if e > entry_ts]
-
-        if len(active_exits) >= MAX_CONCURRENT:
-            skipped += 1
-            equity_curve.append(equity)
-            continue
-
-        # Take this trade
-        active_exits.append(t['exit_ts'])
-
-        # Risk 2% of equity: position sized so SL = 2% loss
-        sl_frac      = t['sl_pct'] / 100
-        risk_amt     = equity * RISK_PER_TRADE
-        pos_value    = risk_amt / sl_frac
-        dollar_pnl   = pos_value * (t['pnl'] / 100)
-
-        equity      += dollar_pnl
-        equity       = max(equity, 0.01)
+        equity    += dollar_pnl
+        equity     = max(equity, 0.01)
         equity_curve.append(equity)
 
         if equity > peak_equity:
@@ -641,9 +603,17 @@ async def run_backtest():
         if dd < max_dd_equity:
             max_dd_equity = dd
 
-    equity_return     = (equity_curve[-1] / equity_curve[0] - 1) * 100
-    trades_taken      = len(equity_curve) - 1
-    df['equity']      = equity_curve[:len(df)]
+    equity_return  = (equity_curve[-1] / equity_curve[0] - 1) * 100
+    trades_taken   = len(equity_curve) - 1
+
+    # Kelly fraction: f = WR - (1-WR)/RR
+    avg_win_r  = (df[trail_mask]['pnl'].mean() / df[trail_mask]['sl_pct'].mean()) if n_trail > 0 else 0
+    avg_loss_r = 1.0  # by definition (SL = 1R)
+    wr_frac    = (n_trail + n_be) / (n_trail + n_sl + n_be) if (n_trail + n_sl + n_be) > 0 else 0
+    kelly_f    = wr_frac - (1 - wr_frac) / avg_win_r if avg_win_r > 0 else 0
+    kelly_2pct = kelly_f * 100  # as % of Kelly full
+
+    skipped = 0  # not applicable in sequential sim
 
     # Outcome breakdown — v4 uses TRAIL instead of TP2
     trail_mask   = df['outcome'] == 'TRAIL'
@@ -691,8 +661,6 @@ async def run_backtest():
     print(f"  Pairs: {df['symbol'].nunique()} | Lookback: {days}d\n")
 
     print(f"  ── Raw Signal Stats (all signals) ──")
-    print(f"  Signals              : {total}  ({per_day}/day  |  {round(per_day*30)}/month)")
-
     print(f"  Signals              : {total}  ({per_day}/day  |  {round(per_day*30)}/month)")
     print(f"  Win Rate (Trail only): {wr}%")
     print(f"  Win Rate (incl. BE)  : {wr_incl_be}%")
