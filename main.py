@@ -38,7 +38,7 @@ logger = logging.getLogger('SwingBacktest')
 
 # ── SETTINGS (must match swing_bot_v1.py exactly) ──────────────────────────
 
-LOOKBACK_DAYS     = 720
+LOOKBACK_DAYS     = 360
 TOP_N_PAIRS       = 600
 MIN_VOLUME_USDT   = 500_000
 
@@ -47,7 +47,7 @@ ATR_SL_MULT       = 1.5   # WIDENED from 1.2 — reduce noise SLs
 TRAIL_ATR_MULT    = 2.5   # unchanged
 TP1_POSITION_PCT  = 0.4   # unchanged
 
-MIN_SCORE_PCT     = 0.69  # RAISED from 0.63 — v7 showed 75%+ band = 75% WR
+MIN_SCORE_PCT     = 0.65  # RAISED from 0.63 — v7 showed 75%+ band = 75% WR
 QUALITY_PREMIUM   = 0.85  # RAISED — ultra-elite signals only
 ADX_MIN           = 50    # RAISED from 40 — ultra-strong trend only
 LONG_BULL_ONLY    = True
