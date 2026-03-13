@@ -20,7 +20,7 @@ HOW IT WORKS
 
 SETUP (run once)
 ────────────────
-  pip install ccxt pandas numpy ta rich tqdm
+  pip install ccxt pandas numpy ta
 
 USAGE
 ─────
@@ -79,7 +79,7 @@ DATE_TO   = "2025-03-01"   # end   of backtest
 PAIRS = [
     "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
     "XRP/USDT:USDT", "DOGE/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT",
-    "ADA/USDT:USDT", "DOT/USDT:USDT",  "MATIC/USDT:USDT","LTC/USDT:USDT",
+    "ADA/USDT:USDT", "DOT/USDT:USDT",  "POL/USDT:USDT", "LTC/USDT:USDT",
     "UNI/USDT:USDT", "ATOM/USDT:USDT", "FIL/USDT:USDT",  "NEAR/USDT:USDT",
     "APT/USDT:USDT", "ARB/USDT:USDT",  "OP/USDT:USDT",   "SUI/USDT:USDT",
     "INJ/USDT:USDT", "TIA/USDT:USDT",  "WLD/USDT:USDT",  "JTO/USDT:USDT",
@@ -600,12 +600,14 @@ def analyse_slice(data: dict, symbol: str):
 async def download_ohlcv(exchange, symbol: str, tf: str,
                          since_ms: int, until_ms: int) -> pd.DataFrame:
     cache_key = symbol.replace('/', '_').replace(':', '_')
-    cache_path = CACHE_DIR / f"{cache_key}_{tf}.parquet"
+    cache_path = CACHE_DIR / f"{cache_key}_{tf}.csv"
 
     if cache_path.exists():
-        df = pd.read_parquet(cache_path)
-        # check coverage
-        if not df.empty:
+        df = pd.read_csv(cache_path, parse_dates=['ts'])
+        if 'ts' in df.columns and not df.empty:
+            # ensure tz-aware
+            if df['ts'].dt.tz is None:
+                df['ts'] = df['ts'].dt.tz_localize('UTC')
             need_more = df['ts'].iloc[-1] < pd.Timestamp(until_ms, unit='ms', tz='UTC') - pd.Timedelta(hours=4)
             if not need_more:
                 mask = (df['ts'] >= pd.Timestamp(since_ms, unit='ms', tz='UTC')) & \
@@ -638,7 +640,7 @@ async def download_ohlcv(exchange, symbol: str, tf: str,
     df.reset_index(drop=True, inplace=True)
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(cache_path, index=False)
+    df.to_csv(cache_path, index=False)
     return df
 
 
